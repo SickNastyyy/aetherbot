@@ -1,5 +1,7 @@
+pub mod aggregator;
 pub mod ai;
 pub mod backtest;
+pub mod correlation;
 pub mod data_provider;
 pub mod error;
 pub mod orders;
@@ -16,7 +18,9 @@ use tracing::{info, warn};
 use tauri::Emitter;
 use crate::database::{self, Database};
 use crate::models::*;
+use aggregator::SignalAggregator;
 use ai::evaluator::{ClaudeEvaluator, ClaudeEvaluatorConfig};
+use correlation::CorrelationEngine;
 use data_provider::candles::{CandleBuilder, Timeframe};
 use data_provider::jupiter::JupiterProvider;
 use data_provider::uniswap::UniswapProvider;
@@ -25,7 +29,7 @@ use data_provider::DataProvider;
 use orders::OrderManager;
 use risk::RiskManager;
 use signals::compute_signal;
-use strategy::StrategyManager;
+use strategy::{StrategyManager, TradeIntent};
 
 /// Exchange + pairs configuration
 struct ExchangeConfig {
@@ -163,6 +167,8 @@ async fn run_tick_loop(
 
     let strategy_manager = StrategyManager::new();
     let mut risk_manager = RiskManager::new();
+    let mut signal_aggregator = SignalAggregator::new(2, 0.45); // min 2 strategies agree, 45% score
+    let mut correlation_engine = CorrelationEngine::new(60);
 
     // Initialize Claude AI evaluator (optional — runs only if API key is configured)
     // Users can set ANTHROPIC_API_KEY env var or store it in credentials
@@ -381,7 +387,28 @@ async fn run_tick_loop(
             }
         }
 
-        // ── 1c. Market regime detection (using ETH as reference) ─────────
+        // ── 1c. Push prices to correlation engine ─────────────────────────
+        for (pair, &price) in &prices {
+            correlation_engine.push_price(pair, price);
+        }
+        // Recompute correlations every 30 ticks
+        if tick_count % 30 == 0 {
+            correlation_engine.compute_correlations();
+        }
+        // Detect divergences and log significant ones
+        let correlation_signals = correlation_engine.detect_divergences(10);
+        if !correlation_signals.is_empty() && tick_count % 30 == 0 {
+            for cs in &correlation_signals {
+                if cs.strength > 0.5 {
+                    let _ = app_handle.emit("bot:log", LogEvent {
+                        level: "info".into(),
+                        message: format!("[Correlation] {}", cs.reason),
+                    });
+                }
+            }
+        }
+
+        // ── 1d. Market regime detection (using ETH as reference) ─────────
         let market_regime = {
             let eth_key = "Uniswap:ETH/USDC";
             candle_builders.get(eth_key)
@@ -459,7 +486,31 @@ async fn run_tick_loop(
                     .map(|b| b.candles().iter().cloned().collect())
                     .unwrap_or_default();
 
-                if let Some((intent, strat_name)) = strategy_manager.evaluate_entry(signal, &candle_slice) {
+                // Collect all strategy votes
+                let all_intents = strategy_manager.evaluate_all(signal, &candle_slice);
+                let votes = signal_aggregator.intents_to_votes(&all_intents);
+
+                // Use aggregator for consensus decision
+                let aggregated = signal_aggregator.aggregate(pair, &signal.exchange, &votes);
+                let trade_decision = aggregated.map(|agg| {
+                    // Find the matching intent for the top strategy
+                    let intent = all_intents.iter()
+                        .find(|(_, name)| *name == agg.top_strategy)
+                        .map(|(i, n)| (i.clone(), *n))
+                        .unwrap_or_else(|| {
+                            let fallback = TradeIntent {
+                                pair: pair.to_string(),
+                                exchange: signal.exchange.clone(),
+                                side: agg.side,
+                                strength: agg.consensus_score,
+                                reason: agg.reason.clone(),
+                            };
+                            (fallback, "Consensus")
+                        });
+                    (intent, agg)
+                });
+
+                if let Some(((intent, strat_name), agg)) = trade_decision {
                     // Regime filter: block longs in bear market, shorts in bull market
                     // (skip for Kalshi — prediction markets aren't correlated the same way)
                     if signal.exchange != "Kalshi" && market_regime != regime::MarketRegime::Unknown {
@@ -519,8 +570,9 @@ async fn run_tick_loop(
                             let _ = app_handle.emit("bot:log", LogEvent {
                                 level: "success".into(),
                                 message: format!(
-                                    "[{}] {} opened {:?} {} — {} (SL: ${:.2}, TP: ${:.2})",
+                                    "[{}] {} opened {:?} {} — {} [{}] (SL: ${:.2}, TP: ${:.2})",
                                     approved.exchange, strat_name, approved.side, pair, result.message,
+                                    agg.reason,
                                     approved.stop_loss, approved.take_profit,
                                 ),
                             });
