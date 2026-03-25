@@ -14,6 +14,8 @@ use tauri::Emitter;
 use crate::models::*;
 use data_provider::candles::{CandleBuilder, Timeframe};
 use data_provider::jupiter::JupiterProvider;
+use data_provider::uniswap::UniswapProvider;
+use data_provider::kalshi::KalshiProvider;
 use data_provider::DataProvider;
 use orders::OrderManager;
 use risk::RiskManager;
@@ -21,8 +23,26 @@ use signals::compute_signal;
 use strategy::ema_crossover::EmaCrossover;
 use strategy::Strategy;
 
-/// Pairs to scan on Jupiter (first vertical slice)
-const JUPITER_PAIRS: &[&str] = &["SOL/USDC", "JUP/USDC"];
+/// Exchange + pairs configuration
+struct ExchangeConfig {
+    name: &'static str,
+    pairs: &'static [&'static str],
+}
+
+const EXCHANGES: &[ExchangeConfig] = &[
+    ExchangeConfig {
+        name: "Jupiter",
+        pairs: &["SOL/USDC", "JUP/USDC"],
+    },
+    ExchangeConfig {
+        name: "Uniswap",
+        pairs: &["ETH/USDC", "WBTC/ETH", "LINK/USDC", "UNI/ETH", "ARB/USDC"],
+    },
+    ExchangeConfig {
+        name: "Kalshi",
+        pairs: &["Fed Rate Cut by June", "BTC above $100k by Q3", "S&P 500 above 6000 by Dec"],
+    },
+];
 
 pub struct BotEngine {
     state: Arc<RwLock<BotEngineState>>,
@@ -67,7 +87,7 @@ impl BotEngine {
             let _ = app_handle.emit("bot:state-change", StateChangeEvent { state: BotEngineState::Running });
             let _ = app_handle.emit("bot:log", LogEvent {
                 level: "success".into(),
-                message: "Engine running — scanning markets".into(),
+                message: "Engine running — scanning all exchanges".into(),
             });
 
             run_tick_loop(state, config, app_handle, shutdown_rx).await;
@@ -106,13 +126,36 @@ impl BotEngine {
     }
 }
 
+/// Provider wrapper for multi-exchange dispatch
+struct Providers {
+    jupiter: JupiterProvider,
+    uniswap: UniswapProvider,
+    kalshi: KalshiProvider,
+}
+
+impl Providers {
+    fn get(&self, exchange: &str) -> &dyn DataProvider {
+        match exchange {
+            "Jupiter" => &self.jupiter,
+            "Uniswap" => &self.uniswap,
+            "Kalshi" => &self.kalshi,
+            _ => &self.jupiter,
+        }
+    }
+}
+
 async fn run_tick_loop(
     state: Arc<RwLock<BotEngineState>>,
     config: Arc<RwLock<AppConfig>>,
     app_handle: tauri::AppHandle,
     mut shutdown_rx: watch::Receiver<bool>,
 ) {
-    let jupiter = JupiterProvider::new();
+    let providers = Providers {
+        jupiter: JupiterProvider::new(),
+        uniswap: UniswapProvider::new(),
+        kalshi: KalshiProvider::new(),
+    };
+
     let strategy = EmaCrossover::default();
     let mut risk_manager = RiskManager::new();
 
@@ -122,10 +165,21 @@ async fn run_tick_loop(
     };
     let mut order_manager = OrderManager::new(initial_balance);
 
-    // Candle builders per pair
+    // Candle builders: key = "Exchange:Pair"
     let mut candle_builders: HashMap<String, CandleBuilder> = HashMap::new();
-    for pair in JUPITER_PAIRS {
-        candle_builders.insert(pair.to_string(), CandleBuilder::new(Timeframe::M1));
+    for exc in EXCHANGES {
+        for pair in exc.pairs {
+            let key = format!("{}:{}", exc.name, pair);
+            candle_builders.insert(key, CandleBuilder::new(Timeframe::M1));
+        }
+    }
+
+    // Bulk-fetch Uniswap prices on first tick
+    if let Err(e) = providers.uniswap.refresh_all_prices().await {
+        let _ = app_handle.emit("bot:log", LogEvent {
+            level: "warn".into(),
+            message: format!("Uniswap initial price fetch failed: {e}"),
+        });
     }
 
     let mut tick_count: u64 = 0;
@@ -139,72 +193,81 @@ async fn run_tick_loop(
         let cfg = config.read().await.clone();
         tick_count += 1;
 
-        // ── 1. Fetch prices ─────────────────────────────────────────────
+        // Bulk refresh Uniswap prices every 5 ticks (they cache for 5s anyway)
+        if tick_count % 5 == 0 {
+            let _ = providers.uniswap.refresh_all_prices().await;
+        }
+
+        // ── 1. Fetch prices from all exchanges ──────────────────────────
         let mut prices: HashMap<String, f64> = HashMap::new();
         let mut all_signals: Vec<Signal> = Vec::new();
         let mut connections: Vec<ConnectionStatus> = Vec::new();
 
-        for pair in JUPITER_PAIRS {
-            let start = std::time::Instant::now();
-            match tokio::time::timeout(
-                std::time::Duration::from_secs(5),
-                jupiter.fetch_price(pair),
-            ).await {
-                Ok(Ok(tick)) => {
-                    let latency = start.elapsed().as_millis() as u64;
-                    prices.insert(pair.to_string(), tick.price);
+        for exc in EXCHANGES {
+            let provider = providers.get(exc.name);
+            let mut exchange_connected = false;
+            let mut exchange_latency: Option<u64> = None;
 
-                    if tick_count <= 2 {
-                        connections.push(ConnectionStatus {
-                            name: "Jupiter".into(),
-                            connected: true,
-                            latency_ms: Some(latency),
-                        });
-                    }
+            for pair in exc.pairs {
+                let start = std::time::Instant::now();
+                match tokio::time::timeout(
+                    std::time::Duration::from_secs(8),
+                    provider.fetch_price(pair),
+                ).await {
+                    Ok(Ok(tick)) => {
+                        let latency = start.elapsed().as_millis() as u64;
+                        prices.insert(pair.to_string(), tick.price);
+                        exchange_connected = true;
+                        if exchange_latency.is_none() {
+                            exchange_latency = Some(latency);
+                        }
 
-                    // Push to candle builder
-                    if let Some(builder) = candle_builders.get_mut(*pair) {
-                        let closed = builder.push_tick(tick.price, tick.volume, tick.timestamp);
-                        if let Some(candle) = closed {
+                        // Push to candle builder
+                        let key = format!("{}:{}", exc.name, pair);
+                        if let Some(builder) = candle_builders.get_mut(&key) {
+                            if let Some(candle) = builder.push_tick(tick.price, tick.volume, tick.timestamp) {
+                                let _ = app_handle.emit("bot:log", LogEvent {
+                                    level: "info".into(),
+                                    message: format!("[{}] {} candle closed @ ${:.4}", exc.name, pair, candle.close),
+                                });
+                            }
+
+                            // Compute signal (only for crypto pairs, not Kalshi events)
+                            if exc.name != "Kalshi" {
+                                let candle_slice: Vec<Candle> = builder.candles().iter().cloned().collect();
+                                if let Some(sig) = compute_signal(pair, exc.name, &candle_slice) {
+                                    all_signals.push(sig);
+                                }
+                            }
+                        }
+
+                        // Log first successful connection per exchange
+                        if tick_count == 1 {
                             let _ = app_handle.emit("bot:log", LogEvent {
-                                level: "info".into(),
-                                message: format!("{} candle closed @ ${:.4}", pair, candle.close),
+                                level: "success".into(),
+                                message: format!("[{}] {} @ ${:.4} ({latency}ms)", exc.name, pair, tick.price),
                             });
                         }
-
-                        // Compute signal
-                        let candle_slice: Vec<Candle> = builder.candles().iter().cloned().collect();
-                        if let Some(sig) = compute_signal(pair, "Jupiter", &candle_slice) {
-                            all_signals.push(sig);
+                    }
+                    Ok(Err(e)) => {
+                        if tick_count <= 2 {
+                            let _ = app_handle.emit("bot:log", LogEvent {
+                                level: "warn".into(),
+                                message: format!("[{}] Failed: {} — {}", exc.name, pair, e),
+                            });
                         }
                     }
-
-                    // First tick — log connection
-                    if tick_count == 1 {
-                        let _ = app_handle.emit("bot:log", LogEvent {
-                            level: "success".into(),
-                            message: format!("Jupiter connected — {pair} @ ${:.4} ({latency}ms)", tick.price),
-                        });
+                    Err(_) => {
+                        warn!("[{}] Timeout fetching {}", exc.name, pair);
                     }
-                }
-                Ok(Err(e)) => {
-                    if tick_count <= 3 {
-                        let _ = app_handle.emit("bot:log", LogEvent {
-                            level: "error".into(),
-                            message: format!("Failed to fetch {pair}: {e}"),
-                        });
-                    }
-                }
-                Err(_) => {
-                    warn!("Timeout fetching {}", pair);
                 }
             }
-        }
 
-        // Placeholder connections for unimplemented exchanges
-        if tick_count <= 2 {
-            connections.push(ConnectionStatus { name: "Uniswap".into(), connected: false, latency_ms: None });
-            connections.push(ConnectionStatus { name: "Kalshi".into(), connected: false, latency_ms: None });
+            connections.push(ConnectionStatus {
+                name: exc.name.to_string(),
+                connected: exchange_connected,
+                latency_ms: exchange_latency,
+            });
         }
 
         // ── 2. Update position prices ───────────────────────────────────
@@ -213,31 +276,30 @@ async fn run_tick_loop(
         // ── 3. Check barriers on open positions ─────────────────────────
         let position_ids: Vec<String> = order_manager.positions().iter().map(|p| p.id.clone()).collect();
         for pos_id in &position_ids {
-            if let Some(pos) = order_manager.positions().iter().find(|p| p.id == *pos_id) {
-                if let Some(exit_reason) = risk_manager.check_barriers(pos, pos.current_price) {
-                    let pair = pos.pair.clone();
-                    let reason_str = format!("{:?}", exit_reason);
-
-                    if let Some((closed_pos, pnl)) = order_manager.close_position(pos_id, pos.current_price, exit_reason) {
-                        if matches!(exit_reason, ExitReason::StopLoss) {
-                            risk_manager.record_stop_loss(&cfg);
-                        }
-
-                        let pnl_str = if pnl >= 0.0 { format!("+${pnl:.2}") } else { format!("-${:.2}", pnl.abs()) };
-                        let level = if pnl >= 0.0 { "success" } else { "warn" };
-
-                        let _ = app_handle.emit("bot:log", LogEvent {
-                            level: level.into(),
-                            message: format!("Closed {} — {reason_str}: {pnl_str}", pair),
-                        });
-
-                        let _ = app_handle.emit("bot:trade", TradeEvent {
-                            trade_type: "close".into(),
-                            position: closed_pos,
-                            reason: reason_str,
-                        });
-                    }
+            let (current_price, pair, exit_reason) = {
+                let pos = match order_manager.positions().iter().find(|p| p.id == *pos_id) {
+                    Some(p) => p,
+                    None => continue,
+                };
+                match risk_manager.check_barriers(pos, pos.current_price) {
+                    Some(reason) => (pos.current_price, pos.pair.clone(), reason),
+                    None => continue,
                 }
+            };
+
+            let reason_str = format!("{:?}", exit_reason);
+            if let Some((_closed_pos, pnl)) = order_manager.close_position(pos_id, current_price, exit_reason) {
+                if matches!(exit_reason, ExitReason::StopLoss) {
+                    risk_manager.record_stop_loss(&cfg);
+                }
+
+                let pnl_str = if pnl >= 0.0 { format!("+${pnl:.2}") } else { format!("-${:.2}", pnl.abs()) };
+                let level = if pnl >= 0.0 { "success" } else { "warn" };
+
+                let _ = app_handle.emit("bot:log", LogEvent {
+                    level: level.into(),
+                    message: format!("Closed {pair} — {reason_str}: {pnl_str}"),
+                });
             }
         }
 
@@ -246,13 +308,13 @@ async fn run_tick_loop(
             for signal in &all_signals {
                 let pair = &signal.pair;
 
-                // Skip if already have a position in this pair
                 if order_manager.positions().iter().any(|p| p.pair == *pair) {
                     continue;
                 }
 
+                let key = format!("{}:{}", signal.exchange, pair);
                 let candle_slice: Vec<Candle> = candle_builders
-                    .get(pair.as_str())
+                    .get(&key)
                     .map(|b| b.candles().iter().cloned().collect())
                     .unwrap_or_default();
 
@@ -262,7 +324,6 @@ async fn run_tick_loop(
                         None => continue,
                     };
 
-                    // Risk check
                     match risk_manager.pre_flight_check(
                         pair,
                         &intent.exchange,
@@ -284,26 +345,17 @@ async fn run_tick_loop(
                             let _ = app_handle.emit("bot:log", LogEvent {
                                 level: "success".into(),
                                 message: format!(
-                                    "Opened {:?} {} — {} (SL: ${:.2}, TP: ${:.2})",
-                                    approved.side, pair, result.message,
+                                    "[{}] Opened {:?} {} — {} (SL: ${:.2}, TP: ${:.2})",
+                                    approved.exchange, approved.side, pair, result.message,
                                     approved.stop_loss, approved.take_profit,
                                 ),
                             });
-
-                            if let Some(pos) = order_manager.positions().last() {
-                                let _ = app_handle.emit("bot:trade", TradeEvent {
-                                    trade_type: "open".into(),
-                                    position: pos.clone(),
-                                    reason: approved.reason,
-                                });
-                            }
                         }
                         Err(veto) => {
-                            // Only log vetoes occasionally to avoid spam
-                            if tick_count % 30 == 0 {
+                            if tick_count % 60 == 0 {
                                 let _ = app_handle.emit("bot:log", LogEvent {
                                     level: "info".into(),
-                                    message: format!("Risk veto on {pair}: {}", veto.reason),
+                                    message: format!("[{}] Risk veto on {}: {}", signal.exchange, pair, veto.reason),
                                 });
                             }
                         }
@@ -322,7 +374,7 @@ async fn run_tick_loop(
             positions,
             signals: all_signals,
             pnl,
-            connections: if tick_count <= 2 { connections } else { vec![] },
+            connections: connections.clone(),
         };
         let _ = app_handle.emit("bot:tick", &tick_event);
 
