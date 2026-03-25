@@ -170,3 +170,321 @@ impl OrderManager {
         self.positions.iter().map(|p| p.id.clone()).collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::engine::risk::ApprovedTrade;
+    use crate::models::{ExitReason, Side};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn approx_eq(a: f64, b: f64, tol: f64) -> bool { (a - b).abs() < tol }
+
+    fn approved_long(entry: f64, qty: f64) -> ApprovedTrade {
+        ApprovedTrade {
+            pair: "BTC/USD".into(),
+            exchange: "paper".into(),
+            side: Side::Long,
+            quantity: qty,
+            entry_price: entry,
+            stop_loss: entry * 0.95,
+            take_profit: entry * 1.10,
+            time_limit_hours: 24,
+            strategy: "test".into(),
+            reason: "unit test".into(),
+        }
+    }
+
+    fn approved_short(entry: f64, qty: f64) -> ApprovedTrade {
+        ApprovedTrade {
+            pair: "ETH/USD".into(),
+            exchange: "paper".into(),
+            side: Side::Short,
+            quantity: qty,
+            entry_price: entry,
+            stop_loss: entry * 1.05,
+            take_profit: entry * 0.90,
+            time_limit_hours: 24,
+            strategy: "test".into(),
+            reason: "unit test".into(),
+        }
+    }
+
+    // ── position tracking: open ───────────────────────────────────────────────
+
+    #[test]
+    fn execute_paper_trade_opens_position() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        assert_eq!(om.open_position_count(), 1);
+    }
+
+    #[test]
+    fn execute_paper_trade_returns_success() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        assert!(result.success);
+    }
+
+    #[test]
+    fn position_id_is_sequential() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 0.1), 1000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 0.1), 1000.0);
+        let ids = om.all_position_ids();
+        assert_eq!(ids[0], "paper-1");
+        assert_eq!(ids[1], "paper-2");
+    }
+
+    #[test]
+    fn position_records_correct_side() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        assert_eq!(om.positions()[0].side, Side::Long);
+
+        let mut om2 = OrderManager::new(10_000.0);
+        om2.execute_paper_trade(&approved_short(1000.0, 1.0), 1000.0);
+        assert_eq!(om2.positions()[0].side, Side::Short);
+    }
+
+    // ── balance changes on entry ──────────────────────────────────────────────
+
+    #[test]
+    fn paper_balance_decreases_on_long_entry() {
+        let initial = 10_000.0;
+        let mut om = OrderManager::new(initial);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        assert!(
+            om.paper_balance() < initial,
+            "balance should decrease after buying, got {}",
+            om.paper_balance()
+        );
+    }
+
+    #[test]
+    fn paper_balance_decreases_by_cost_plus_fee() {
+        let initial = 10_000.0;
+        let mut om = OrderManager::new(initial);
+        let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        let expected_balance = initial - (result.filled_quantity * result.filled_price + result.fee);
+        assert!(
+            approx_eq(om.paper_balance(), expected_balance, 1e-6),
+            "balance should be initial minus (cost + fee), expected {expected_balance:.4}, got {:.4}",
+            om.paper_balance()
+        );
+    }
+
+    // ── close position ────────────────────────────────────────────────────────
+
+    #[test]
+    fn close_position_removes_it_from_list() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        let id = om.all_position_ids()[0].clone();
+        om.close_position(&id, 1100.0, ExitReason::TakeProfit);
+        assert_eq!(om.open_position_count(), 0);
+    }
+
+    #[test]
+    fn close_nonexistent_position_returns_none() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.close_position("nonexistent", 1000.0, ExitReason::Manual);
+        assert!(result.is_none());
+    }
+
+    // ── P&L for longs ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn long_position_pnl_positive_when_price_rises() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        let id = om.all_position_ids()[0].clone();
+        // Close at price above filled_price
+        let exit_price = result.filled_price + 100.0;
+        let (_, pnl) = om.close_position(&id, exit_price, ExitReason::TakeProfit).unwrap();
+        assert!(pnl > 0.0, "long P&L should be positive when price rises, got {pnl}");
+    }
+
+    #[test]
+    fn long_position_pnl_negative_when_price_falls() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        let id = om.all_position_ids()[0].clone();
+        let exit_price = result.filled_price - 100.0;
+        let (_, pnl) = om.close_position(&id, exit_price, ExitReason::StopLoss).unwrap();
+        assert!(pnl < 0.0, "long P&L should be negative when price falls, got {pnl}");
+    }
+
+    #[test]
+    fn long_pnl_calculation_is_correct() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_long(1000.0, 2.0), 1000.0);
+        // filled_price has slippage; P&L = (exit - entry) * qty
+        let exit = result.filled_price + 50.0;
+        let id = om.all_position_ids()[0].clone();
+        let (_, pnl) = om.close_position(&id, exit, ExitReason::TakeProfit).unwrap();
+        let expected = (exit - result.filled_price) * 2.0;
+        assert!(
+            approx_eq(pnl, expected, 1e-6),
+            "long P&L expected {expected:.4}, got {pnl:.4}"
+        );
+    }
+
+    // ── P&L for shorts ────────────────────────────────────────────────────────
+
+    #[test]
+    fn short_position_pnl_positive_when_price_falls() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_short(1000.0, 1.0), 1000.0);
+        let id = om.all_position_ids()[0].clone();
+        // Short profits when price falls
+        let exit_price = result.filled_price - 100.0;
+        let (_, pnl) = om.close_position(&id, exit_price, ExitReason::TakeProfit).unwrap();
+        assert!(pnl > 0.0, "short P&L should be positive when price falls, got {pnl}");
+    }
+
+    #[test]
+    fn short_position_pnl_negative_when_price_rises() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_short(1000.0, 1.0), 1000.0);
+        let id = om.all_position_ids()[0].clone();
+        let exit_price = result.filled_price + 100.0;
+        let (_, pnl) = om.close_position(&id, exit_price, ExitReason::StopLoss).unwrap();
+        assert!(pnl < 0.0, "short P&L should be negative when price rises, got {pnl}");
+    }
+
+    #[test]
+    fn short_pnl_calculation_is_correct() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_short(1000.0, 3.0), 1000.0);
+        // P&L for short = (entry - exit) * qty
+        let exit = result.filled_price - 50.0;
+        let id = om.all_position_ids()[0].clone();
+        let (_, pnl) = om.close_position(&id, exit, ExitReason::TakeProfit).unwrap();
+        let expected = (result.filled_price - exit) * 3.0;
+        assert!(
+            approx_eq(pnl, expected, 1e-6),
+            "short P&L expected {expected:.4}, got {pnl:.4}"
+        );
+    }
+
+    // ── balance after close ───────────────────────────────────────────────────
+
+    #[test]
+    fn paper_balance_increases_after_closing_profitable_long() {
+        let mut om = OrderManager::new(10_000.0);
+        let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        let balance_after_entry = om.paper_balance();
+        let id = om.all_position_ids()[0].clone();
+        om.close_position(&id, result.filled_price + 200.0, ExitReason::TakeProfit);
+        assert!(
+            om.paper_balance() > balance_after_entry,
+            "balance should increase after closing profitable long"
+        );
+    }
+
+    // ── update_prices ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn update_prices_updates_unrealized_pnl_for_long() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+
+        let entry = om.positions()[0].entry_price;
+        let new_price = entry + 200.0;
+        let mut prices = std::collections::HashMap::new();
+        prices.insert("BTC/USD".to_string(), new_price);
+
+        om.update_prices(&prices);
+
+        let pnl = om.positions()[0].unrealized_pnl;
+        assert!(pnl > 0.0, "unrealized P&L should be positive after price rise, got {pnl}");
+        assert!(
+            approx_eq(pnl, 200.0, 1.0),
+            "unrealized P&L should be ~200, got {pnl:.4}"
+        );
+    }
+
+    #[test]
+    fn update_prices_with_exchange_prefixed_key() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        let entry = om.positions()[0].entry_price;
+        let new_price = entry + 100.0;
+
+        let mut prices = std::collections::HashMap::new();
+        // Key format: "exchange:pair"
+        prices.insert("paper:BTC/USD".to_string(), new_price);
+        om.update_prices(&prices);
+
+        assert!(
+            approx_eq(om.positions()[0].current_price, new_price, 1e-9),
+            "update_prices should support 'exchange:pair' key"
+        );
+    }
+
+    // ── trade count & win rate ────────────────────────────────────────────────
+
+    #[test]
+    fn trade_count_increments_per_open() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 0.1), 1000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 0.1), 1000.0);
+        assert_eq!(om.pnl_summary().total_trades, 2);
+    }
+
+    #[test]
+    fn win_rate_100_pct_after_all_winning_trades() {
+        let mut om = OrderManager::new(50_000.0);
+        // Open and close two profitable longs
+        for _ in 0..2 {
+            let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+            let id = om.all_position_ids().last().unwrap().clone();
+            om.close_position(&id, result.filled_price + 100.0, ExitReason::TakeProfit);
+        }
+        let summary = om.pnl_summary();
+        assert!(
+            approx_eq(summary.win_rate, 100.0, 1e-9),
+            "win rate should be 100%, got {}",
+            summary.win_rate
+        );
+    }
+
+    #[test]
+    fn win_rate_0_pct_after_all_losing_trades() {
+        let mut om = OrderManager::new(50_000.0);
+        for _ in 0..2 {
+            let result = om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+            let id = om.all_position_ids().last().unwrap().clone();
+            om.close_position(&id, result.filled_price - 100.0, ExitReason::StopLoss);
+        }
+        let summary = om.pnl_summary();
+        assert!(
+            approx_eq(summary.win_rate, 0.0, 1e-9),
+            "win rate should be 0%, got {}",
+            summary.win_rate
+        );
+    }
+
+    // ── total equity ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn total_equity_includes_open_position_value() {
+        let mut om = OrderManager::new(10_000.0);
+        om.execute_paper_trade(&approved_long(1000.0, 1.0), 1000.0);
+        // total_equity = cash + sum(qty * current_price)
+        let pos = &om.positions()[0];
+        let expected = om.paper_balance() + pos.quantity * pos.current_price;
+        assert!(
+            approx_eq(om.total_equity(), expected, 1e-6),
+            "total equity should include open position value"
+        );
+    }
+
+    #[test]
+    fn initial_total_equity_equals_paper_balance() {
+        let om = OrderManager::new(10_000.0);
+        assert!(approx_eq(om.total_equity(), 10_000.0, 1e-9));
+    }
+}

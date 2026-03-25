@@ -238,3 +238,346 @@ impl RiskManager {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::models::{AppConfig, Candle, ExitReason, Position, Side};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    fn default_config() -> AppConfig {
+        AppConfig {
+            paper_mode: true,
+            max_drawdown_pct: 10.0,
+            position_size_pct: 5.0,
+            stop_loss_pct: 2.0,
+            take_profit_atr_mult: 3.0,
+            stop_loss_atr_mult: 2.0,
+            max_hold_hours: 24,
+            max_concurrent_positions: 5,
+            cooldown_minutes: 0, // no cooldown for tests
+            max_stops_before_pause: 3,
+            stops_window_minutes: 60,
+            max_slippage_pct: 1.0,
+            min_liquidity_usd: 10_000.0,
+            paper_balance: 10_000.0,
+            tick_interval_ms: 1000,
+        }
+    }
+
+    fn make_candles(n: usize, price: f64) -> Vec<Candle> {
+        (0..n).map(|_| Candle {
+            open: price,
+            high: price * 1.02,
+            low: price * 0.98,
+            close: price,
+            volume: 1000.0,
+            timestamp: 0,
+            timeframe: "1m".into(),
+        }).collect()
+    }
+
+    fn make_position(side: Side, entry: f64, stop: f64, tp: f64) -> Position {
+        Position {
+            id: "test-1".into(),
+            exchange: "paper".into(),
+            pair: "BTC/USD".into(),
+            side,
+            entry_price: entry,
+            current_price: entry,
+            quantity: 1.0,
+            unrealized_pnl: 0.0,
+            unrealized_pnl_pct: 0.0,
+            stop_loss: stop,
+            take_profit: tp,
+            // Set time_limit far in the future
+            time_limit: (chrono::Utc::now() + chrono::Duration::hours(24)).to_rfc3339(),
+            strategy: "test".into(),
+            opened_at: chrono::Utc::now().to_rfc3339(),
+        }
+    }
+
+    fn run_preflight(
+        rm: &RiskManager,
+        config: &AppConfig,
+        side: Side,
+        portfolio_equity: f64,
+        open_positions: u32,
+        daily_pnl: f64,
+    ) -> Result<ApprovedTrade, RiskVeto> {
+        let candles = make_candles(20, 1000.0);
+        rm.pre_flight_check(
+            "BTC/USD",
+            "paper",
+            side,
+            0.8,
+            1000.0,
+            &candles,
+            portfolio_equity,
+            open_positions,
+            daily_pnl,
+            config,
+            "test_strategy",
+            "test signal",
+        )
+    }
+
+    // ── pre_flight_check — happy path ─────────────────────────────────────────
+
+    #[test]
+    fn preflight_approves_valid_trade() {
+        let rm = RiskManager::new();
+        let config = default_config();
+        let result = run_preflight(&rm, &config, Side::Long, 10_000.0, 0, 0.0);
+        assert!(result.is_ok(), "valid trade should be approved: {:?}", result);
+    }
+
+    #[test]
+    fn preflight_approved_trade_has_correct_side() {
+        let rm = RiskManager::new();
+        let config = default_config();
+        let trade = run_preflight(&rm, &config, Side::Short, 10_000.0, 0, 0.0).unwrap();
+        assert_eq!(trade.side, Side::Short);
+    }
+
+    // ── pre_flight_check — max drawdown ───────────────────────────────────────
+
+    #[test]
+    fn preflight_rejects_when_max_drawdown_exceeded() {
+        let rm = RiskManager::new();
+        let mut config = default_config();
+        config.max_drawdown_pct = 5.0;
+        // daily_pnl = -600, equity = 10_000 → drawdown = 6% > 5%
+        let result = run_preflight(&rm, &config, Side::Long, 10_000.0, 0, -600.0);
+        assert!(result.is_err(), "should reject when drawdown exceeds limit");
+        let veto = result.unwrap_err();
+        assert!(veto.reason.contains("drawdown"), "veto reason should mention drawdown: {}", veto.reason);
+    }
+
+    #[test]
+    fn preflight_allows_at_exactly_drawdown_limit() {
+        let rm = RiskManager::new();
+        let mut config = default_config();
+        config.max_drawdown_pct = 5.0;
+        // daily_pnl = -500, equity = 10_000 → drawdown = 5.0% == limit (not strictly greater)
+        let result = run_preflight(&rm, &config, Side::Long, 10_000.0, 0, -500.0);
+        // 5.0 > 5.0 is false, so the trade should be approved
+        assert!(result.is_ok(), "should allow when drawdown equals (not exceeds) limit");
+    }
+
+    // ── pre_flight_check — max positions ─────────────────────────────────────
+
+    #[test]
+    fn preflight_rejects_when_max_positions_reached() {
+        let rm = RiskManager::new();
+        let mut config = default_config();
+        config.max_concurrent_positions = 3;
+        let result = run_preflight(&rm, &config, Side::Long, 10_000.0, 3, 0.0);
+        assert!(result.is_err(), "should reject when at max positions");
+        let veto = result.unwrap_err();
+        assert!(veto.reason.contains("Max positions"), "reason: {}", veto.reason);
+    }
+
+    #[test]
+    fn preflight_allows_one_below_max_positions() {
+        let rm = RiskManager::new();
+        let mut config = default_config();
+        config.max_concurrent_positions = 3;
+        let result = run_preflight(&rm, &config, Side::Long, 10_000.0, 2, 0.0);
+        assert!(result.is_ok());
+    }
+
+    // ── pre_flight_check — position too small ─────────────────────────────────
+
+    #[test]
+    fn preflight_rejects_position_too_small() {
+        let rm = RiskManager::new();
+        let mut config = default_config();
+        // Tiny equity: 5% of $0.10 = $0.005 → way below $1 minimum
+        config.position_size_pct = 5.0;
+        let candles = make_candles(20, 1000.0);
+        let result = rm.pre_flight_check(
+            "BTC/USD", "paper", Side::Long, 0.8, 1000.0,
+            &candles, 0.10, 0, 0.0,
+            &config, "test", "test",
+        );
+        assert!(result.is_err(), "tiny position should be rejected");
+        let veto = result.unwrap_err();
+        assert!(veto.reason.contains("too small"), "reason: {}", veto.reason);
+    }
+
+    // ── pre_flight_check — ATR stop placement ─────────────────────────────────
+
+    #[test]
+    fn stop_loss_below_entry_for_long() {
+        let rm = RiskManager::new();
+        let config = default_config();
+        let trade = run_preflight(&rm, &config, Side::Long, 10_000.0, 0, 0.0).unwrap();
+        assert!(
+            trade.stop_loss < trade.entry_price,
+            "stop_loss {} must be below entry {} for long",
+            trade.stop_loss, trade.entry_price
+        );
+    }
+
+    #[test]
+    fn stop_loss_above_entry_for_short() {
+        let rm = RiskManager::new();
+        let config = default_config();
+        let trade = run_preflight(&rm, &config, Side::Short, 10_000.0, 0, 0.0).unwrap();
+        assert!(
+            trade.stop_loss > trade.entry_price,
+            "stop_loss {} must be above entry {} for short",
+            trade.stop_loss, trade.entry_price
+        );
+    }
+
+    #[test]
+    fn take_profit_above_entry_for_long() {
+        let rm = RiskManager::new();
+        let config = default_config();
+        let trade = run_preflight(&rm, &config, Side::Long, 10_000.0, 0, 0.0).unwrap();
+        assert!(trade.take_profit > trade.entry_price);
+    }
+
+    #[test]
+    fn take_profit_below_entry_for_short() {
+        let rm = RiskManager::new();
+        let config = default_config();
+        let trade = run_preflight(&rm, &config, Side::Short, 10_000.0, 0, 0.0).unwrap();
+        assert!(trade.take_profit < trade.entry_price);
+    }
+
+    // ── check_barriers — stop-loss ────────────────────────────────────────────
+
+    #[test]
+    fn check_barriers_triggers_stop_loss_for_long() {
+        let rm = RiskManager::new();
+        let pos = make_position(Side::Long, 1000.0, 950.0, 1100.0);
+        // Price hits below stop
+        let exit = rm.check_barriers(&pos, 940.0);
+        assert_eq!(exit, Some(ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn check_barriers_triggers_stop_loss_at_exact_level_for_long() {
+        let rm = RiskManager::new();
+        let pos = make_position(Side::Long, 1000.0, 950.0, 1100.0);
+        let exit = rm.check_barriers(&pos, 950.0);
+        assert_eq!(exit, Some(ExitReason::StopLoss));
+    }
+
+    #[test]
+    fn check_barriers_triggers_stop_loss_for_short() {
+        let rm = RiskManager::new();
+        let pos = make_position(Side::Short, 1000.0, 1050.0, 900.0);
+        // Price rises above stop
+        let exit = rm.check_barriers(&pos, 1060.0);
+        assert_eq!(exit, Some(ExitReason::StopLoss));
+    }
+
+    // ── check_barriers — take-profit ──────────────────────────────────────────
+
+    #[test]
+    fn check_barriers_triggers_take_profit_for_long() {
+        let rm = RiskManager::new();
+        let pos = make_position(Side::Long, 1000.0, 950.0, 1100.0);
+        let exit = rm.check_barriers(&pos, 1100.0);
+        assert_eq!(exit, Some(ExitReason::TakeProfit));
+    }
+
+    #[test]
+    fn check_barriers_triggers_take_profit_for_short() {
+        let rm = RiskManager::new();
+        let pos = make_position(Side::Short, 1000.0, 1050.0, 900.0);
+        let exit = rm.check_barriers(&pos, 890.0);
+        assert_eq!(exit, Some(ExitReason::TakeProfit));
+    }
+
+    // ── check_barriers — no exit ──────────────────────────────────────────────
+
+    #[test]
+    fn check_barriers_no_exit_when_price_inside_bands() {
+        let rm = RiskManager::new();
+        let pos = make_position(Side::Long, 1000.0, 950.0, 1100.0);
+        let exit = rm.check_barriers(&pos, 1020.0);
+        assert!(exit.is_none(), "price inside bands should not trigger exit");
+    }
+
+    #[test]
+    fn check_barriers_time_limit_triggers_on_expired_position() {
+        let rm = RiskManager::new();
+        let mut pos = make_position(Side::Long, 1000.0, 950.0, 1100.0);
+        // Set time_limit to the past
+        pos.time_limit = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+        let exit = rm.check_barriers(&pos, 1020.0); // price is fine, time is not
+        assert_eq!(exit, Some(ExitReason::TimeLimit));
+    }
+
+    // ── circuit breaker ───────────────────────────────────────────────────────
+
+    #[test]
+    fn circuit_breaker_not_active_by_default() {
+        let rm = RiskManager::new();
+        assert!(!rm.is_circuit_breaker_active());
+    }
+
+    #[test]
+    fn circuit_breaker_activates_after_n_stops() {
+        let mut rm = RiskManager::new();
+        let mut config = default_config();
+        config.max_stops_before_pause = 3;
+        config.cooldown_minutes = 30;
+
+        rm.record_stop_loss(&config);
+        assert!(!rm.is_circuit_breaker_active(), "1 stop: no breaker");
+        rm.record_stop_loss(&config);
+        assert!(!rm.is_circuit_breaker_active(), "2 stops: no breaker");
+        rm.record_stop_loss(&config);
+        assert!(rm.is_circuit_breaker_active(), "3 stops: breaker should trip");
+    }
+
+    #[test]
+    fn circuit_breaker_blocks_new_trades() {
+        let mut rm = RiskManager::new();
+        let mut config = default_config();
+        config.max_stops_before_pause = 2;
+        config.cooldown_minutes = 30;
+
+        rm.record_stop_loss(&config);
+        rm.record_stop_loss(&config);
+        assert!(rm.is_circuit_breaker_active());
+
+        let result = run_preflight(&rm, &config, Side::Long, 10_000.0, 0, 0.0);
+        assert!(result.is_err(), "circuit breaker should block new trades");
+        assert!(result.unwrap_err().reason.contains("Circuit breaker"));
+    }
+
+    // ── record_trade / cooldown ───────────────────────────────────────────────
+
+    #[test]
+    fn record_trade_inserts_pair_cooldown() {
+        let mut rm = RiskManager::new();
+        rm.record_trade("BTC/USD");
+        assert!(rm.pair_cooldowns.contains_key("BTC/USD"));
+    }
+
+    #[test]
+    fn preflight_rejects_pair_under_cooldown() {
+        let mut rm = RiskManager::new();
+        let mut config = default_config();
+        config.cooldown_minutes = 30;
+
+        rm.record_trade("BTC/USD");
+
+        let candles = make_candles(20, 1000.0);
+        let result = rm.pre_flight_check(
+            "BTC/USD", "paper", Side::Long, 0.8, 1000.0,
+            &candles, 10_000.0, 0, 0.0,
+            &config, "test", "test",
+        );
+        assert!(result.is_err(), "pair under cooldown should be rejected");
+        assert!(result.unwrap_err().reason.contains("cooldown"));
+    }
+}
