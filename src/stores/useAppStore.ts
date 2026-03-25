@@ -2,6 +2,16 @@ import { create } from 'zustand'
 import type { MockTrade, PnlSummary, SystemStatus, TradeLogEntry, BotState, StopMode, ConnectionStatus } from '@/lib/types'
 import { MOCK_TRADES, MOCK_PNL, MOCK_SYSTEM_STATUS } from '@/lib/constants'
 
+function isTauri(): boolean {
+  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
+}
+
+// Start with empty data in Tauri, mock data in browser
+const initialTrades = isTauri() ? [] : MOCK_TRADES
+const initialPnl: PnlSummary = isTauri()
+  ? { total_pnl: 0, total_pnl_pct: 0, today_pnl: 0, win_rate: 0, total_trades: 0, active_positions: 0 }
+  : MOCK_PNL
+
 interface AppState {
   trades: MockTrade[]
   pnl: PnlSummary
@@ -9,8 +19,8 @@ interface AppState {
   tradeLog: TradeLogEntry[]
   selectedPair: string
   activePage: 'dashboard' | 'settings'
+  livePrices: Record<string, number>
 
-  // Bot control
   botState: BotState
   showStopDialog: boolean
 
@@ -19,13 +29,11 @@ interface AppState {
   setActivePage: (page: 'dashboard' | 'settings') => void
   incrementUptime: () => void
 
-  // Bot control actions
   startBot: () => void
   requestStop: () => void
   confirmStop: (mode: StopMode) => void
   cancelStop: () => void
 
-  // Engine event handlers
   setBotStateFromEngine: (state: string) => void
   updateConnections: (connections: ConnectionStatus[]) => void
   updateFromTick: (data: {
@@ -39,29 +47,24 @@ interface AppState {
     pnl?: PnlSummary
     prices?: Record<string, number>
   }) => void
-  livePrices: Record<string, number>
-}
-
-function isTauri(): boolean {
-  return typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
 }
 
 export const useAppStore = create<AppState>((set, get) => ({
-  trades: MOCK_TRADES,
-  pnl: MOCK_PNL,
+  trades: initialTrades,
+  pnl: initialPnl,
   systemStatus: MOCK_SYSTEM_STATUS,
   tradeLog: [],
   selectedPair: 'SOL/USDC',
   activePage: 'dashboard',
+  livePrices: {},
 
   botState: 'idle',
   showStopDialog: false,
-  livePrices: {},
 
   addLogEntry: (entry) =>
     set((state) => ({
       tradeLog: [
-        ...state.tradeLog.slice(-99),
+        ...state.tradeLog.slice(-199),
         {
           ...entry,
           id: crypto.randomUUID(),
@@ -84,7 +87,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     if (isTauri()) {
       try {
         const { invoke } = await import('@tauri-apps/api/core')
-        set({ botState: 'scanning' })
+        set({ botState: 'scanning', trades: [], pnl: { total_pnl: 0, total_pnl_pct: 0, today_pnl: 0, win_rate: 0, total_trades: 0, active_positions: 0 } })
         await invoke('start_bot')
       } catch (e) {
         console.error('Failed to start bot:', e)
@@ -92,7 +95,6 @@ export const useAppStore = create<AppState>((set, get) => ({
         set({ botState: 'idle' })
       }
     } else {
-      // Browser fallback — mock behavior
       const { addLogEntry } = get()
       set({
         botState: 'scanning',
@@ -110,9 +112,7 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  requestStop: () => {
-    set({ showStopDialog: true })
-  },
+  requestStop: () => set({ showStopDialog: true }),
 
   confirmStop: async (mode: StopMode) => {
     set({ showStopDialog: false, botState: 'stopping' })
@@ -126,7 +126,6 @@ export const useAppStore = create<AppState>((set, get) => ({
         get().addLogEntry({ level: 'error', message: `Failed to stop: ${e}` })
       }
     } else {
-      // Browser fallback
       const { addLogEntry } = get()
       if (mode === 'liquidate') {
         addLogEntry({ level: 'warn', message: 'Liquidating all positions (dev mode)...' })
@@ -140,9 +139,7 @@ export const useAppStore = create<AppState>((set, get) => ({
               ...state.systemStatus,
               bot_running: false,
               connections: state.systemStatus.connections.map((c) => ({
-                ...c,
-                connected: false,
-                latency_ms: undefined,
+                ...c, connected: false, latency_ms: undefined,
               })),
             },
           }))
@@ -156,9 +153,7 @@ export const useAppStore = create<AppState>((set, get) => ({
             ...state.systemStatus,
             bot_running: false,
             connections: state.systemStatus.connections.map((c) => ({
-              ...c,
-              connected: false,
-              latency_ms: undefined,
+              ...c, connected: false, latency_ms: undefined,
             })),
           },
         }))
@@ -166,35 +161,22 @@ export const useAppStore = create<AppState>((set, get) => ({
     }
   },
 
-  cancelStop: () => {
-    set({ showStopDialog: false })
-  },
+  cancelStop: () => set({ showStopDialog: false }),
 
-  // Called by useBotEvents when engine emits state changes
   setBotStateFromEngine: (state: string) => {
     const stateMap: Record<string, BotState> = {
-      idle: 'idle',
-      starting: 'scanning',
-      running: 'scanning',
-      stopping: 'stopping',
-      error: 'idle',
+      idle: 'idle', starting: 'scanning', running: 'scanning', stopping: 'stopping', error: 'idle',
     }
     const mapped = stateMap[state] || 'idle'
     set({
       botState: mapped,
-      systemStatus: {
-        ...get().systemStatus,
-        bot_running: mapped === 'scanning',
-      },
+      systemStatus: { ...get().systemStatus, bot_running: mapped === 'scanning' },
     })
   },
 
   updateConnections: (connections: ConnectionStatus[]) => {
     set((state) => ({
-      systemStatus: {
-        ...state.systemStatus,
-        connections,
-      },
+      systemStatus: { ...state.systemStatus, connections },
     }))
   },
 
@@ -203,10 +185,7 @@ export const useAppStore = create<AppState>((set, get) => ({
       const updates: Partial<typeof state> = {}
 
       if (data.connections?.length) {
-        updates.systemStatus = {
-          ...state.systemStatus,
-          connections: data.connections,
-        }
+        updates.systemStatus = { ...state.systemStatus, connections: data.connections }
       }
 
       if (data.pnl) {

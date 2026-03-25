@@ -1,3 +1,4 @@
+pub mod ai;
 pub mod data_provider;
 pub mod error;
 pub mod orders;
@@ -12,6 +13,7 @@ use tracing::{info, warn};
 
 use tauri::Emitter;
 use crate::models::*;
+use ai::evaluator::{ClaudeEvaluator, ClaudeEvaluatorConfig};
 use data_provider::candles::{CandleBuilder, Timeframe};
 use data_provider::jupiter::JupiterProvider;
 use data_provider::uniswap::UniswapProvider;
@@ -159,6 +161,25 @@ async fn run_tick_loop(
     let strategy = EmaCrossover::default();
     let mut risk_manager = RiskManager::new();
 
+    // Initialize Claude AI evaluator (optional — runs only if API key is configured)
+    // Users can set ANTHROPIC_API_KEY env var or store it in credentials
+    let claude_api_key = std::env::var("ANTHROPIC_API_KEY").unwrap_or_default();
+    let claude_evaluator = ClaudeEvaluator::new(ClaudeEvaluatorConfig {
+        api_key: claude_api_key.clone(),
+        ..Default::default()
+    });
+    if claude_evaluator.is_configured() {
+        let _ = app_handle.emit("bot:log", LogEvent {
+            level: "success".into(),
+            message: "Claude AI evaluator enabled — will analyze markets every 60s".into(),
+        });
+    } else {
+        let _ = app_handle.emit("bot:log", LogEvent {
+            level: "info".into(),
+            message: "Claude AI evaluator not configured (set ANTHROPIC_API_KEY to enable)".into(),
+        });
+    }
+
     let initial_balance = {
         let cfg = config.read().await;
         cfg.paper_balance
@@ -268,6 +289,51 @@ async fn run_tick_loop(
                 connected: exchange_connected,
                 latency_ms: exchange_latency,
             });
+        }
+
+        // ── 1b. Claude AI evaluation (every 60 ticks ≈ 1 minute) ────────
+        if claude_evaluator.is_configured() && tick_count % 60 == 0 && !prices.is_empty() {
+            // Pick the top pair by volume/activity for Claude analysis
+            for exc in EXCHANGES {
+                if exc.name == "Kalshi" { continue; } // Skip prediction markets for now
+                if let Some(pair) = exc.pairs.first() {
+                    let key = format!("{}:{}", exc.name, pair);
+                    if let Some(builder) = candle_builders.get(&key) {
+                        let candle_slice: Vec<Candle> = builder.candles().iter().cloned().collect();
+                        if candle_slice.len() >= 20 {
+                            // Get current indicators for context
+                            let indicators: HashMap<String, f64> = all_signals.iter()
+                                .find(|s| s.pair == *pair && s.exchange == exc.name)
+                                .map(|s| s.indicators.clone())
+                                .unwrap_or_default();
+
+                            if let Some(&current_price) = prices.get(*pair) {
+                                if let Some(claude_signal) = claude_evaluator.evaluate(
+                                    pair, exc.name, &candle_slice, &indicators, current_price
+                                ).await {
+                                    let confidence = claude_signal.indicators.get("claude_confidence")
+                                        .copied().unwrap_or(0.0);
+
+                                    let _ = app_handle.emit("bot:log", LogEvent {
+                                        level: "info".into(),
+                                        message: format!(
+                                            "[Claude AI] {}: {:?} ({:.0}% confidence)",
+                                            pair, claude_signal.direction, confidence * 100.0
+                                        ),
+                                    });
+
+                                    // Claude signal overrides TA signal if high confidence
+                                    if confidence >= 0.8 {
+                                        // Remove existing signal for this pair and replace
+                                        all_signals.retain(|s| !(s.pair == *pair && s.exchange == exc.name));
+                                        all_signals.push(claude_signal);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         // ── 2. Update position prices ───────────────────────────────────

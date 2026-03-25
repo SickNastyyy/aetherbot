@@ -94,6 +94,11 @@ export function TradesTable() {
             </AnimatePresence>
           </tbody>
         </table>
+        {trades.length === 0 && (
+          <div className="flex items-center justify-center py-8 text-holo-text-muted/40 text-[11px]">
+            No open positions — start the bot to begin trading
+          </div>
+        )}
       </div>
     </div>
   )
