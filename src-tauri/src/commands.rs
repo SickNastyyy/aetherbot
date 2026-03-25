@@ -187,6 +187,23 @@ pub fn get_trade_history(
 }
 
 #[tauri::command]
+pub fn run_backtest(
+    exchange: String,
+    pair: String,
+    db: tauri::State<'_, Database>,
+) -> Result<crate::engine::backtest::BacktestResult, String> {
+    let config = crate::engine::backtest::BacktestConfig {
+        exchange,
+        pair,
+        initial_balance: 10000.0,
+        position_size_pct: 5.0,
+        stop_loss_pct: 3.0,
+        take_profit_pct: 6.0,
+    };
+    crate::engine::backtest::run_backtest(&db, config)
+}
+
+#[tauri::command]
 pub async fn get_bot_state(
     engine_state: tauri::State<'_, EngineState>,
 ) -> Result<BotEngineState, String> {

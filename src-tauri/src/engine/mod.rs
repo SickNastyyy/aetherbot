@@ -1,7 +1,9 @@
 pub mod ai;
+pub mod backtest;
 pub mod data_provider;
 pub mod error;
 pub mod orders;
+pub mod regime;
 pub mod risk;
 pub mod signals;
 pub mod strategy;
@@ -379,6 +381,25 @@ async fn run_tick_loop(
             }
         }
 
+        // ── 1c. Market regime detection (using ETH as reference) ─────────
+        let market_regime = {
+            let eth_key = "Uniswap:ETH/USDC";
+            candle_builders.get(eth_key)
+                .map(|b| {
+                    let candles: Vec<Candle> = b.candles().iter().cloned().collect();
+                    regime::detect_regime(&candles)
+                })
+                .unwrap_or(regime::MarketRegime::Unknown)
+        };
+
+        // Log regime changes
+        if tick_count == 1 || tick_count % 300 == 0 {
+            let _ = app_handle.emit("bot:log", LogEvent {
+                level: "info".into(),
+                message: format!("Market regime: {} (based on ETH trend)", market_regime.label()),
+            });
+        }
+
         // ── 2. Update position prices ───────────────────────────────────
         order_manager.update_prices(&prices);
 
@@ -439,6 +460,26 @@ async fn run_tick_loop(
                     .unwrap_or_default();
 
                 if let Some((intent, strat_name)) = strategy_manager.evaluate_entry(signal, &candle_slice) {
+                    // Regime filter: block longs in bear market, shorts in bull market
+                    // (skip for Kalshi — prediction markets aren't correlated the same way)
+                    if signal.exchange != "Kalshi" && market_regime != regime::MarketRegime::Unknown {
+                        let blocked = match intent.side {
+                            Side::Long => !market_regime.allow_longs(),
+                            Side::Short => !market_regime.allow_shorts(),
+                        };
+                        if blocked {
+                            if tick_count % 120 == 0 {
+                                let _ = app_handle.emit("bot:log", LogEvent {
+                                    level: "info".into(),
+                                    message: format!(
+                                        "Regime filter: {:?} {} blocked in {} market",
+                                        intent.side, pair, market_regime.label()
+                                    ),
+                                });
+                            }
+                            continue;
+                        }
+                    }
                     let current_price = match prices.get(pair.as_str()) {
                         Some(&p) => p,
                         None => continue,

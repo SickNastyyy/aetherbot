@@ -37,6 +37,7 @@ pub fn run() {
             stop_bot,
             get_bot_state,
             get_trade_history,
+            run_backtest,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

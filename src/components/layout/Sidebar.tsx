@@ -4,6 +4,7 @@ import {
   Settings,
   TrendingUp,
   Activity,
+  History,
 } from 'lucide-react'
 import { ScrollArea } from '@/components/ui/scroll-area'
 import { useAppStore } from '@/stores/useAppStore'
@@ -11,6 +12,7 @@ import { JUPITER_PAIRS, UNISWAP_PAIRS, KALSHI_EVENTS } from '@/lib/constants'
 
 const navItems = [
   { id: 'dashboard' as const, label: 'Dashboard', icon: LayoutDashboard },
+  { id: 'history' as const, label: 'Trade History', icon: History },
   { id: 'settings' as const, label: 'Settings', icon: Settings },
 ]
 

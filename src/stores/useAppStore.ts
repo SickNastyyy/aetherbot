@@ -18,7 +18,7 @@ interface AppState {
   systemStatus: SystemStatus
   tradeLog: TradeLogEntry[]
   selectedPair: string
-  activePage: 'dashboard' | 'settings'
+  activePage: 'dashboard' | 'settings' | 'history'
   livePrices: Record<string, number>
 
   botState: BotState

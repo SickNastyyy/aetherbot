@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from '@tanstack/react-query'
 import { MainLayout } from '@/components/layout/MainLayout'
 import { Dashboard } from '@/pages/Dashboard'
 import { Settings } from '@/pages/Settings'
+import { TradeHistory } from '@/pages/TradeHistory'
 import { useAppStore } from '@/stores/useAppStore'
 
 const queryClient = new QueryClient()
@@ -11,7 +12,7 @@ function AppContent() {
 
   return (
     <MainLayout>
-      {activePage === 'dashboard' ? <Dashboard /> : <Settings />}
+      {activePage === 'dashboard' ? <Dashboard /> : activePage === 'history' ? <TradeHistory /> : <Settings />}
     </MainLayout>
   )
 }
