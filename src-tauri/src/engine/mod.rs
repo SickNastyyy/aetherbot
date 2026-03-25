@@ -7,6 +7,7 @@ pub mod error;
 pub mod orders;
 pub mod regime;
 pub mod risk;
+pub mod sentiment;
 pub mod signals;
 pub mod strategy;
 
@@ -21,6 +22,7 @@ use crate::models::*;
 use aggregator::SignalAggregator;
 use ai::evaluator::{ClaudeEvaluator, ClaudeEvaluatorConfig};
 use correlation::CorrelationEngine;
+use sentiment::SentimentEngine;
 use data_provider::candles::{CandleBuilder, Timeframe};
 use data_provider::jupiter::JupiterProvider;
 use data_provider::uniswap::UniswapProvider;
@@ -167,8 +169,25 @@ async fn run_tick_loop(
 
     let strategy_manager = StrategyManager::new();
     let mut risk_manager = RiskManager::new();
-    let mut signal_aggregator = SignalAggregator::new(2, 0.45); // min 2 strategies agree, 45% score
+    let mut signal_aggregator = SignalAggregator::new(2, 0.45);
     let mut correlation_engine = CorrelationEngine::new(60);
+
+    // Sentiment engine: uses Grok for Twitter, Reddit public API, CryptoCompare news
+    let grok_api_key = std::env::var("XAI_API_KEY")
+        .or_else(|_| std::env::var("GROK_API_KEY"))
+        .unwrap_or_default();
+    let mut sentiment_engine = SentimentEngine::new(grok_api_key.clone());
+    if sentiment_engine.is_configured() {
+        let _ = app_handle.emit("bot:log", LogEvent {
+            level: "success".into(),
+            message: "Sentiment engine enabled — Grok (Twitter/X) + Reddit + News".into(),
+        });
+    } else {
+        let _ = app_handle.emit("bot:log", LogEvent {
+            level: "info".into(),
+            message: "Sentiment: Reddit + News active (set XAI_API_KEY for Twitter/X via Grok)".into(),
+        });
+    }
 
     // Initialize Claude AI evaluator (optional — runs only if API key is configured)
     // Users can set ANTHROPIC_API_KEY env var or store it in credentials
@@ -408,7 +427,25 @@ async fn run_tick_loop(
             }
         }
 
-        // ── 1d. Market regime detection (using ETH as reference) ─────────
+        // ── 1d. Sentiment analysis (every 300 ticks ≈ 5 minutes) ─────────
+        if tick_count % 300 == 0 {
+            let tokens_to_analyze = ["SOL", "ETH", "BTC"];
+            for token in &tokens_to_analyze {
+                if let Some(sentiment) = sentiment_engine.analyze(token).await {
+                    let level = if sentiment.composite_score.abs() > 0.3 { "info" } else { "info" };
+                    let _ = app_handle.emit("bot:log", LogEvent {
+                        level: level.into(),
+                        message: format!(
+                            "[Sentiment] {}: {:.0}% ({:?}) — {}",
+                            token, sentiment.composite_score * 100.0,
+                            sentiment.direction, sentiment.summary
+                        ),
+                    });
+                }
+            }
+        }
+
+        // ── 1e. Market regime detection (using ETH as reference) ─────────
         let market_regime = {
             let eth_key = "Uniswap:ETH/USDC";
             candle_builders.get(eth_key)
