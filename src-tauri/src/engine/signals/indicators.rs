@@ -1,4 +1,5 @@
 use crate::models::Candle;
+use serde::{Serialize, Deserialize};
 
 /// Exponential Moving Average
 pub fn ema(data: &[f64], period: usize) -> Option<Vec<f64>> {
@@ -145,4 +146,131 @@ pub fn bollinger_bands(
     }
 
     Some((upper, middle, lower))
+}
+
+/// Simple Moving Average
+pub fn sma(data: &[f64], period: usize) -> Option<Vec<f64>> {
+    if data.len() < period { return None; }
+    let mut result = vec![0.0; period - 1];
+    for i in (period - 1)..data.len() {
+        let avg: f64 = data[i + 1 - period..=i].iter().sum::<f64>() / period as f64;
+        result.push(avg);
+    }
+    Some(result)
+}
+
+/// Volume-Weighted Average Price (resets every `reset_period` candles, default 1440 = 1 day of 1m candles)
+pub fn vwap(candles: &[Candle], reset_period: usize) -> Option<Vec<f64>> {
+    if candles.is_empty() { return None; }
+    let mut result = Vec::with_capacity(candles.len());
+    let mut cum_tp_vol = 0.0;
+    let mut cum_vol = 0.0;
+
+    for (i, c) in candles.iter().enumerate() {
+        if i % reset_period == 0 {
+            cum_tp_vol = 0.0;
+            cum_vol = 0.0;
+        }
+        let typical = (c.high + c.low + c.close) / 3.0;
+        let vol = if c.volume > 0.0 { c.volume } else { 1.0 };
+        cum_tp_vol += typical * vol;
+        cum_vol += vol;
+        result.push(if cum_vol > 0.0 { cum_tp_vol / cum_vol } else { c.close });
+    }
+    Some(result)
+}
+
+/// Bollinger Bandwidth = (upper - lower) / middle
+pub fn bollinger_bandwidth(closes: &[f64], period: usize, num_std: f64) -> Option<Vec<f64>> {
+    let (upper, middle, lower) = bollinger_bands(closes, period, num_std)?;
+    let bw: Vec<f64> = upper.iter().zip(middle.iter()).zip(lower.iter())
+        .map(|((u, m), l)| if *m != 0.0 { (u - l) / m } else { 0.0 })
+        .collect();
+    Some(bw)
+}
+
+/// Bollinger %B = (price - lower) / (upper - lower)
+pub fn bollinger_pct_b(closes: &[f64], period: usize, num_std: f64) -> Option<Vec<f64>> {
+    let (upper, _middle, lower) = bollinger_bands(closes, period, num_std)?;
+    let pct_b: Vec<f64> = closes.iter().zip(upper.iter()).zip(lower.iter())
+        .map(|((p, u), l)| {
+            let range = u - l;
+            if range > 0.0 { (p - l) / range } else { 0.5 }
+        })
+        .collect();
+    Some(pct_b)
+}
+
+/// Rate of Change (percent)
+pub fn roc(data: &[f64], period: usize) -> Option<Vec<f64>> {
+    if data.len() <= period { return None; }
+    let mut result = vec![0.0; period];
+    for i in period..data.len() {
+        let prev = data[i - period];
+        result.push(if prev != 0.0 { ((data[i] - prev) / prev) * 100.0 } else { 0.0 });
+    }
+    Some(result)
+}
+
+/// Volume Profile — identifies Point of Control and Value Area
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct VolumeProfile {
+    pub poc: f64,
+    pub value_area_high: f64,
+    pub value_area_low: f64,
+}
+
+pub fn volume_profile(candles: &[Candle], num_bins: usize) -> Option<VolumeProfile> {
+    if candles.len() < 10 || num_bins == 0 { return None; }
+
+    let min_price = candles.iter().map(|c| c.low).fold(f64::INFINITY, f64::min);
+    let max_price = candles.iter().map(|c| c.high).fold(f64::NEG_INFINITY, f64::max);
+    let range = max_price - min_price;
+    if range <= 0.0 { return None; }
+
+    let bin_size = range / num_bins as f64;
+    let mut bins = vec![0.0f64; num_bins];
+
+    for c in candles {
+        let typical = (c.high + c.low + c.close) / 3.0;
+        let bin_idx = ((typical - min_price) / bin_size).floor() as usize;
+        let idx = bin_idx.min(num_bins - 1);
+        let vol = if c.volume > 0.0 { c.volume } else { 1.0 };
+        bins[idx] += vol;
+    }
+
+    // POC = price level of highest volume bin
+    let max_bin = bins.iter().enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .map(|(i, _)| i)
+        .unwrap_or(0);
+    let poc = min_price + (max_bin as f64 + 0.5) * bin_size;
+
+    // Value Area = 70% of volume centered on POC
+    let total_vol: f64 = bins.iter().sum();
+    let target = total_vol * 0.70;
+    let mut va_vol = bins[max_bin];
+    let mut va_low_idx = max_bin;
+    let mut va_high_idx = max_bin;
+
+    while va_vol < target {
+        let try_low = if va_low_idx > 0 { bins[va_low_idx - 1] } else { 0.0 };
+        let try_high = if va_high_idx < num_bins - 1 { bins[va_high_idx + 1] } else { 0.0 };
+
+        if try_low == 0.0 && try_high == 0.0 { break; }
+
+        if try_low >= try_high {
+            va_low_idx = va_low_idx.saturating_sub(1);
+            va_vol += try_low;
+        } else {
+            va_high_idx = (va_high_idx + 1).min(num_bins - 1);
+            va_vol += try_high;
+        }
+    }
+
+    Some(VolumeProfile {
+        poc,
+        value_area_high: min_price + (va_high_idx as f64 + 1.0) * bin_size,
+        value_area_low: min_price + va_low_idx as f64 * bin_size,
+    })
 }
