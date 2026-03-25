@@ -3,6 +3,17 @@ export interface AppConfig {
   max_drawdown_pct: number
   position_size_pct: number
   stop_loss_pct: number
+  take_profit_atr_mult?: number
+  stop_loss_atr_mult?: number
+  max_hold_hours?: number
+  max_concurrent_positions?: number
+  cooldown_minutes?: number
+  max_stops_before_pause?: number
+  stops_window_minutes?: number
+  max_slippage_pct?: number
+  min_liquidity_usd?: number
+  paper_balance?: number
+  tick_interval_ms?: number
 }
 
 export interface ExchangeCredentials {

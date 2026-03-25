@@ -1,5 +1,5 @@
 import { useState, useEffect } from 'react'
-import { Save, AlertTriangle, Shield, Loader2 } from 'lucide-react'
+import { Save, AlertTriangle, Shield, Loader2, Timer, Zap, Brain } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Label } from '@/components/ui/label'
@@ -10,6 +10,43 @@ import { saveAppConfig, getAppConfig, tauriAvailable } from '@/hooks/useTauriCom
 function clamp(value: number, min: number, max: number): number {
   if (Number.isNaN(value)) return min
   return Math.min(max, Math.max(min, value))
+}
+
+function NumericField({
+  label,
+  value,
+  min,
+  max,
+  step,
+  hint,
+  onChange,
+}: {
+  label: string
+  value: number
+  min: number
+  max: number
+  step?: number
+  hint: string
+  onChange: (val: number) => void
+}) {
+  return (
+    <div className="space-y-1.5">
+      <Label className="text-[11px] text-holo-text/60">{label}</Label>
+      <Input
+        type="number"
+        min={min}
+        max={max}
+        step={step ?? 1}
+        value={value}
+        onChange={(e) => {
+          const num = Number(e.target.value)
+          onChange(e.target.value === '' || Number.isNaN(num) ? min : clamp(num, min, max))
+        }}
+        className="bg-holo-dark/50 border-holo-border text-xs font-mono text-holo-text-bright"
+      />
+      <p className="text-[10px] text-holo-text/30">{hint}</p>
+    </div>
+  )
 }
 
 export function RiskParams() {
@@ -28,18 +65,10 @@ export function RiskParams() {
 
   const handleSave = async () => {
     setError(null)
-    const validated = {
-      paper_mode: config.paper_mode,
-      max_drawdown_pct: clamp(config.max_drawdown_pct, 1, 100),
-      position_size_pct: clamp(config.position_size_pct, 1, 100),
-      stop_loss_pct: clamp(config.stop_loss_pct, 0.1, 50),
-    }
-    setConfig(validated)
-
     setSaving(true)
     try {
       if (tauriAvailable()) {
-        await saveAppConfig(validated)
+        await saveAppConfig(config)
       }
       setJustSaved(true)
       setTimeout(() => setJustSaved(false), 2000)
@@ -50,23 +79,9 @@ export function RiskParams() {
     }
   }
 
-  const handleNumberChange = (
-    field: 'max_drawdown_pct' | 'position_size_pct' | 'stop_loss_pct',
-    value: string,
-    min: number,
-    max: number,
-  ) => {
-    const num = Number(value)
-    if (value === '' || Number.isNaN(num)) {
-      setConfig({ [field]: min })
-    } else {
-      setConfig({ [field]: clamp(num, min, max) })
-    }
-  }
-
   return (
     <div className="space-y-6">
-      {/* Paper/Live Toggle */}
+      {/* Trading Mode */}
       <div className="space-y-3">
         <h4 className="text-sm font-semibold text-holo-text-bright flex items-center gap-2">
           <Shield size={14} className="text-holo-yellow" />
@@ -80,7 +95,7 @@ export function RiskParams() {
             <p className="text-[11px] text-holo-text/50">
               {config.paper_mode
                 ? 'Simulated trades — no real funds used'
-                : 'Real orders will be executed'}
+                : 'Real orders will be executed on-chain'}
             </p>
           </div>
           <Switch
@@ -92,8 +107,7 @@ export function RiskParams() {
           <div className="flex items-start gap-2 p-3 rounded-lg bg-holo-red/5 border border-holo-red/20">
             <AlertTriangle size={14} className="text-holo-red shrink-0 mt-0.5" />
             <p className="text-[11px] text-holo-red/80">
-              Live mode is enabled. Real funds will be used for trading. Ensure your risk
-              parameters are properly configured before starting the bot.
+              Live mode enabled — real funds will be used. Configure risk parameters carefully.
             </p>
           </div>
         )}
@@ -101,48 +115,133 @@ export function RiskParams() {
 
       {/* Risk Parameters */}
       <div className="space-y-4">
-        <h4 className="text-sm font-semibold text-holo-text-bright">Risk Parameters</h4>
+        <h4 className="text-sm font-semibold text-holo-text-bright flex items-center gap-2">
+          <Zap size={14} className="text-holo-cyan" />
+          Risk Parameters
+        </h4>
 
         <div className="grid grid-cols-3 gap-4">
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-holo-text/60">Max Drawdown %</Label>
-            <Input
-              type="number"
-              min={1}
-              max={100}
-              value={config.max_drawdown_pct}
-              onChange={(e) => handleNumberChange('max_drawdown_pct', e.target.value, 1, 100)}
-              className="bg-holo-dark/50 border-holo-border text-xs font-mono text-holo-text-bright"
-            />
-            <p className="text-[10px] text-holo-text/30">Kill-switch trigger</p>
-          </div>
+          <NumericField
+            label="Max Drawdown %"
+            value={config.max_drawdown_pct}
+            min={1} max={100}
+            hint="Kill-switch trigger"
+            onChange={(v) => setConfig({ max_drawdown_pct: v })}
+          />
+          <NumericField
+            label="Position Size %"
+            value={config.position_size_pct}
+            min={1} max={100}
+            hint="% of equity per trade"
+            onChange={(v) => setConfig({ position_size_pct: v })}
+          />
+          <NumericField
+            label="Stop-Loss % (fallback)"
+            value={config.stop_loss_pct}
+            min={0.1} max={50} step={0.1}
+            hint="Used when ATR unavailable"
+            onChange={(v) => setConfig({ stop_loss_pct: v })}
+          />
+        </div>
+      </div>
 
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-holo-text/60">Position Size %</Label>
-            <Input
-              type="number"
-              min={1}
-              max={100}
-              value={config.position_size_pct}
-              onChange={(e) => handleNumberChange('position_size_pct', e.target.value, 1, 100)}
-              className="bg-holo-dark/50 border-holo-border text-xs font-mono text-holo-text-bright"
-            />
-            <p className="text-[10px] text-holo-text/30">% of portfolio per trade</p>
-          </div>
+      {/* ATR Dynamic Stops */}
+      <div className="space-y-4">
+        <h4 className="text-sm font-semibold text-holo-text-bright flex items-center gap-2">
+          <Brain size={14} className="text-holo-purple" />
+          Dynamic Stops (ATR-Based)
+        </h4>
 
-          <div className="space-y-1.5">
-            <Label className="text-[11px] text-holo-text/60">Stop-Loss %</Label>
-            <Input
-              type="number"
-              min={0.1}
-              max={50}
-              step={0.1}
-              value={config.stop_loss_pct}
-              onChange={(e) => handleNumberChange('stop_loss_pct', e.target.value, 0.1, 50)}
-              className="bg-holo-dark/50 border-holo-border text-xs font-mono text-holo-text-bright"
-            />
-            <p className="text-[10px] text-holo-text/30">Per-position stop</p>
-          </div>
+        <div className="grid grid-cols-3 gap-4">
+          <NumericField
+            label="Stop-Loss ATR Multiplier"
+            value={config.stop_loss_atr_mult ?? 2.0}
+            min={0.5} max={10} step={0.1}
+            hint="SL = ATR x this value"
+            onChange={(v) => setConfig({ stop_loss_atr_mult: v })}
+          />
+          <NumericField
+            label="Take-Profit ATR Multiplier"
+            value={config.take_profit_atr_mult ?? 3.0}
+            min={0.5} max={20} step={0.1}
+            hint="TP = ATR x this value"
+            onChange={(v) => setConfig({ take_profit_atr_mult: v })}
+          />
+          <NumericField
+            label="Max Hold (hours)"
+            value={config.max_hold_hours ?? 24}
+            min={1} max={720}
+            hint="Time limit per position"
+            onChange={(v) => setConfig({ max_hold_hours: v })}
+          />
+        </div>
+      </div>
+
+      {/* Circuit Breakers */}
+      <div className="space-y-4">
+        <h4 className="text-sm font-semibold text-holo-text-bright flex items-center gap-2">
+          <Timer size={14} className="text-holo-orange" />
+          Circuit Breakers
+        </h4>
+
+        <div className="grid grid-cols-2 gap-4">
+          <NumericField
+            label="Max Concurrent Positions"
+            value={config.max_concurrent_positions ?? 5}
+            min={1} max={20}
+            hint="Hard cap on open trades"
+            onChange={(v) => setConfig({ max_concurrent_positions: v })}
+          />
+          <NumericField
+            label="Cooldown (minutes)"
+            value={config.cooldown_minutes ?? 30}
+            min={1} max={1440}
+            hint="Pause after circuit breaker"
+            onChange={(v) => setConfig({ cooldown_minutes: v })}
+          />
+          <NumericField
+            label="Max Stops Before Pause"
+            value={config.max_stops_before_pause ?? 3}
+            min={1} max={20}
+            hint="Stop-losses to trigger halt"
+            onChange={(v) => setConfig({ max_stops_before_pause: v })}
+          />
+          <NumericField
+            label="Stops Window (minutes)"
+            value={config.stops_window_minutes ?? 60}
+            min={5} max={1440}
+            hint="Lookback for stop count"
+            onChange={(v) => setConfig({ stops_window_minutes: v })}
+          />
+        </div>
+      </div>
+
+      {/* DEX Settings */}
+      <div className="space-y-4">
+        <h4 className="text-sm font-semibold text-holo-text-bright">DEX & Execution</h4>
+
+        <div className="grid grid-cols-3 gap-4">
+          <NumericField
+            label="Max Slippage %"
+            value={config.max_slippage_pct ?? 1.0}
+            min={0.1} max={5} step={0.1}
+            hint="Reject swaps above this"
+            onChange={(v) => setConfig({ max_slippage_pct: v })}
+          />
+          <NumericField
+            label="Min Liquidity ($)"
+            value={config.min_liquidity_usd ?? 10000}
+            min={100} max={10000000} step={100}
+            hint="Skip illiquid pools"
+            onChange={(v) => setConfig({ min_liquidity_usd: v })}
+          />
+          <NumericField
+            label="Paper Balance ($)"
+            value={config.paper_balance ?? 10000}
+            min={100} max={10000000} step={100}
+            hint="Starting simulation funds"
+            onChange={(v) => setConfig({ paper_balance: v })}
+          />
         </div>
       </div>
 

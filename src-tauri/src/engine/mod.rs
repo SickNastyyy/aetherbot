@@ -22,8 +22,7 @@ use data_provider::DataProvider;
 use orders::OrderManager;
 use risk::RiskManager;
 use signals::compute_signal;
-use strategy::ema_crossover::EmaCrossover;
-use strategy::Strategy;
+use strategy::StrategyManager;
 
 /// Exchange + pairs configuration
 struct ExchangeConfig {
@@ -158,7 +157,7 @@ async fn run_tick_loop(
         kalshi: KalshiProvider::new(),
     };
 
-    let strategy = EmaCrossover::default();
+    let strategy_manager = StrategyManager::new();
     let mut risk_manager = RiskManager::new();
 
     // Initialize Claude AI evaluator (optional — runs only if API key is configured)
@@ -384,7 +383,7 @@ async fn run_tick_loop(
                     .map(|b| b.candles().iter().cloned().collect())
                     .unwrap_or_default();
 
-                if let Some(intent) = strategy.should_enter(signal, &candle_slice) {
+                if let Some((intent, strat_name)) = strategy_manager.evaluate_entry(signal, &candle_slice) {
                     let current_price = match prices.get(pair.as_str()) {
                         Some(&p) => p,
                         None => continue,
@@ -401,7 +400,7 @@ async fn run_tick_loop(
                         order_manager.open_position_count(),
                         order_manager.pnl_summary().today_pnl,
                         &cfg,
-                        strategy.name(),
+                        strat_name,
                         &intent.reason,
                     ) {
                         Ok(approved) => {
@@ -411,8 +410,8 @@ async fn run_tick_loop(
                             let _ = app_handle.emit("bot:log", LogEvent {
                                 level: "success".into(),
                                 message: format!(
-                                    "[{}] Opened {:?} {} — {} (SL: ${:.2}, TP: ${:.2})",
-                                    approved.exchange, approved.side, pair, result.message,
+                                    "[{}] {} opened {:?} {} — {} (SL: ${:.2}, TP: ${:.2})",
+                                    approved.exchange, strat_name, approved.side, pair, result.message,
                                     approved.stop_loss, approved.take_profit,
                                 ),
                             });
