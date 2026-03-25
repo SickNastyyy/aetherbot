@@ -12,6 +12,7 @@ use tokio::sync::{watch, RwLock};
 use tracing::{info, warn};
 
 use tauri::Emitter;
+use crate::database::{self, Database};
 use crate::models::*;
 use ai::evaluator::{ClaudeEvaluator, ClaudeEvaluatorConfig};
 use data_provider::candles::{CandleBuilder, Timeframe};
@@ -66,7 +67,7 @@ impl BotEngine {
         *self.state.read().await
     }
 
-    pub async fn start(&mut self) {
+    pub async fn start(&mut self, db: std::sync::Arc<Database>) {
         let current = *self.state.read().await;
         if current == BotEngineState::Running {
             return;
@@ -91,7 +92,7 @@ impl BotEngine {
                 message: "Engine running — scanning all exchanges".into(),
             });
 
-            run_tick_loop(state, config, app_handle, shutdown_rx).await;
+            run_tick_loop(state, config, app_handle, shutdown_rx, db).await;
         });
     }
 
@@ -150,6 +151,7 @@ async fn run_tick_loop(
     config: Arc<RwLock<AppConfig>>,
     app_handle: tauri::AppHandle,
     mut shutdown_rx: watch::Receiver<bool>,
+    db: std::sync::Arc<Database>,
 ) {
     let providers = Providers {
         jupiter: JupiterProvider::new(),
@@ -191,6 +193,30 @@ async fn run_tick_loop(
         for pair in exc.pairs {
             let key = format!("{}:{}", exc.name, pair);
             candle_builders.insert(key, CandleBuilder::new(Timeframe::M1));
+        }
+    }
+
+    // Load candle history from database on startup
+    {
+        let conn = db.conn.lock().unwrap();
+        for exc in EXCHANGES {
+            for pair in exc.pairs {
+                let key = format!("{}:{}", exc.name, pair);
+                if let Some(builder) = candle_builders.get_mut(&key) {
+                    match database::load_recent_candles(&conn, exc.name, pair, "1m", 200) {
+                        Ok(rows) if !rows.is_empty() => {
+                            for row in &rows {
+                                builder.push_tick(row.close, row.volume, row.timestamp);
+                            }
+                            let _ = app_handle.emit("bot:log", LogEvent {
+                                level: "info".into(),
+                                message: format!("[{}] Loaded {} candles for {}", exc.name, rows.len(), pair),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
+            }
         }
     }
 
@@ -246,18 +272,36 @@ async fn run_tick_loop(
                         let key = format!("{}:{}", exc.name, pair);
                         if let Some(builder) = candle_builders.get_mut(&key) {
                             if let Some(candle) = builder.push_tick(tick.price, tick.volume, tick.timestamp) {
+                                // Persist candle to database
+                                if let Ok(conn) = db.conn.lock() {
+                                    let _ = database::insert_candle(
+                                        &conn, exc.name, pair, &candle.timeframe,
+                                        candle.open, candle.high, candle.low, candle.close,
+                                        candle.volume, candle.timestamp,
+                                    );
+                                }
                                 let _ = app_handle.emit("bot:log", LogEvent {
                                     level: "info".into(),
                                     message: format!("[{}] {} candle closed @ ${:.4}", exc.name, pair, candle.close),
                                 });
                             }
 
-                            // Compute signal (only for crypto pairs, not Kalshi events)
-                            if exc.name != "Kalshi" {
-                                let candle_slice: Vec<Candle> = builder.candles().iter().cloned().collect();
-                                if let Some(sig) = compute_signal(pair, exc.name, &candle_slice) {
-                                    all_signals.push(sig);
+                            // Compute signals
+                            let candle_slice: Vec<Candle> = builder.candles().iter().cloned().collect();
+                            if exc.name == "Kalshi" {
+                                // For Kalshi, create a simple signal from price data
+                                // (TA indicators don't apply to probability data the same way)
+                                if candle_slice.len() >= 5 {
+                                    all_signals.push(Signal {
+                                        pair: pair.to_string(),
+                                        exchange: exc.name.to_string(),
+                                        direction: Direction::Neutral,
+                                        strength: 0.5,
+                                        indicators: std::collections::HashMap::new(),
+                                    });
                                 }
+                            } else if let Some(sig) = compute_signal(pair, exc.name, &candle_slice) {
+                                all_signals.push(sig);
                             }
                         }
 
@@ -353,9 +397,20 @@ async fn run_tick_loop(
             };
 
             let reason_str = format!("{:?}", exit_reason);
-            if let Some((_closed_pos, pnl)) = order_manager.close_position(pos_id, current_price, exit_reason) {
+            if let Some((closed_pos, pnl)) = order_manager.close_position(pos_id, current_price, exit_reason) {
                 if matches!(exit_reason, ExitReason::StopLoss) {
                     risk_manager.record_stop_loss(&cfg);
+                }
+
+                // Persist close to database
+                if let Ok(conn) = db.conn.lock() {
+                    let pnl_pct = if closed_pos.entry_price > 0.0 {
+                        (pnl / (closed_pos.entry_price * closed_pos.quantity)) * 100.0
+                    } else { 0.0 };
+                    let _ = database::close_trade(
+                        &conn, &closed_pos.id, current_price, pnl, pnl_pct,
+                        &reason_str, &chrono::Utc::now().to_rfc3339(),
+                    );
                 }
 
                 let pnl_str = if pnl >= 0.0 { format!("+${pnl:.2}") } else { format!("-${:.2}", pnl.abs()) };
@@ -407,6 +462,19 @@ async fn run_tick_loop(
                             let result = order_manager.execute_paper_trade(&approved, current_price);
                             risk_manager.record_trade(pair);
 
+                            // Persist trade to database
+                            if let Some(pos) = order_manager.positions().last() {
+                                if let Ok(conn) = db.conn.lock() {
+                                    let side_str = match approved.side { Side::Long => "LONG", Side::Short => "SHORT" };
+                                    let _ = database::insert_trade(
+                                        &conn, &pos.id, &approved.exchange, pair, side_str,
+                                        pos.entry_price, pos.quantity, strat_name,
+                                        approved.stop_loss, approved.take_profit,
+                                        &pos.time_limit, &pos.opened_at,
+                                    );
+                                }
+                            }
+
                             let _ = app_handle.emit("bot:log", LogEvent {
                                 level: "success".into(),
                                 message: format!(
@@ -443,7 +511,22 @@ async fn run_tick_loop(
         };
         let _ = app_handle.emit("bot:tick", &tick_event);
 
-        // ── 6. Sleep until next tick ────────────────────────────────────
+        // ── 6. Periodic portfolio snapshot ───────────────────────────────
+        if tick_count % 60 == 0 {
+            if let Ok(conn) = db.conn.lock() {
+                let _ = database::insert_portfolio_snapshot(
+                    &conn,
+                    &chrono::Utc::now().to_rfc3339(),
+                    order_manager.total_equity(),
+                    order_manager.paper_balance(),
+                    pnl.total_pnl,
+                    pnl.active_positions,
+                    pnl.total_trades,
+                );
+            }
+        }
+
+        // ── 7. Sleep until next tick ────────────────────────────────────
         tokio::select! {
             _ = tokio::time::sleep(std::time::Duration::from_millis(cfg.tick_interval_ms)) => {},
             _ = shutdown_rx.changed() => {

@@ -103,7 +103,7 @@ pub struct ConnectionStatus {
     pub latency_ms: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct PnlSummary {
     pub total_pnl: f64,
     pub total_pnl_pct: f64,

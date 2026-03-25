@@ -1,6 +1,7 @@
 pub mod ema_crossover;
 pub mod rsi_reversion;
 pub mod momentum;
+pub mod kalshi_edge;
 
 use crate::models::{Signal, Candle, Side};
 
@@ -47,6 +48,7 @@ impl StrategyManager {
                 Box::new(ema_crossover::EmaCrossover::default()),
                 Box::new(rsi_reversion::RsiReversion::default()),
                 Box::new(momentum::Momentum::default()),
+                Box::new(kalshi_edge::KalshiEdge::default()),
             ],
         }
     }

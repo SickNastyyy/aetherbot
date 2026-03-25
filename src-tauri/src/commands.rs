@@ -1,7 +1,9 @@
 use crate::config;
+use crate::database::Database;
 use crate::engine::BotEngine;
 use crate::models::*;
 use crate::EngineState;
+use std::sync::Arc;
 
 const ALLOWED_EXCHANGES: &[&str] = &["Jupiter", "Uniswap", "Kalshi"];
 const MAX_KEY_LENGTH: usize = 256;
@@ -134,6 +136,7 @@ pub fn get_mock_pnl() -> PnlSummary {
 pub async fn start_bot(
     app: tauri::AppHandle,
     engine_state: tauri::State<'_, EngineState>,
+    db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
     let mut engine_lock = engine_state.lock().await;
 
@@ -143,7 +146,15 @@ pub async fn start_bot(
 
     let config = config::load_config()?;
     let mut engine = BotEngine::new(app, config);
-    engine.start().await;
+
+    // Create an Arc to share database with the engine
+    // We re-open a connection since Tauri manages the original
+    let db_path = crate::paths::get_data_dir()?.join("trades.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| format!("Failed to open database for engine: {e}"))?;
+    let engine_db = Arc::new(Database { conn: std::sync::Mutex::new(conn) });
+
+    engine.start(engine_db).await;
     *engine_lock = Some(engine);
 
     Ok(())
@@ -164,6 +175,15 @@ pub async fn stop_bot(
         }
         None => Err("Bot is not running".into()),
     }
+}
+
+#[tauri::command]
+pub fn get_trade_history(
+    limit: u32,
+    db: tauri::State<'_, Database>,
+) -> Result<Vec<crate::database::TradeHistoryRow>, String> {
+    let conn = db.conn.lock().map_err(|e| format!("DB lock error: {e}"))?;
+    crate::database::get_trade_history(&conn, limit).map_err(|e| format!("DB error: {e}"))
 }
 
 #[tauri::command]
