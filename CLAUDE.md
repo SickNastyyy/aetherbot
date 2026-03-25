@@ -7,71 +7,65 @@ AetherBot is a desktop crypto + prediction market trading bot built with **Tauri
 
 ```
 Rust Backend (src-tauri/src/)
-  engine/           — Core trading engine (async tick loop on tokio)
-    data_provider/  — Price feeds: Jupiter API, Uniswap, Kalshi
-    signals/        — TA indicators (RSI, EMA, MACD, ATR, Bollinger)
-    strategy/       — Pluggable strategies (Strategy trait)
-    risk/           — Pre-flight checks, circuit breakers, stops
-    orders/         — Order execution + paper executor
-  commands.rs       — Tauri IPC commands
-  models.rs         — All shared types (Serialize/Deserialize)
-  config.rs         — JSON config persistence
-  crypto.rs         — AES-256-GCM credential encryption
-  database.rs       — SQLite via rusqlite (trades, logs, candles)
+  engine/                — Core trading engine (async tick loop on tokio)
+    ai/                  — Claude Trading Brain + evaluator
+    aggregator.rs        — Weighted consensus signal aggregation (10 strategies vote)
+    backtest.rs          — Backtesting engine (replay candles through strategies)
+    correlation.rs       — Cross-pair Pearson correlation + divergence detection
+    data_provider/       — Price feeds: Jupiter API, Uniswap (DefiLlama), Kalshi
+    orders/              — Order execution + paper executor
+    regime.rs            — Market regime detection (ETH EMA-50/200)
+    risk/                — Pre-flight checks, circuit breakers, ATR stops, triple barrier
+    sentiment/           — Twitter (Grok/xAI), Reddit, CryptoCompare news
+    signals/             — 15+ TA indicators (RSI, EMA, MACD, ATR, BB, VWAP, VolumeProfile, ROC...)
+    strategy/            — 10 pluggable strategies (trend, reversion, volatility, volume, prediction)
+  commands.rs            — Tauri IPC commands
+  models.rs              — All shared types (Serialize/Deserialize)
+  config.rs              — JSON config persistence
+  crypto.rs              — AES-256-GCM credential encryption
+  database.rs            — SQLite (trades, candles, portfolio snapshots, logs)
 
 React Frontend (src/)
-  pages/            — Dashboard, Settings
-  components/       — UI components (dashboard/, layout/, charts/, orb/, settings/, ui/)
-  stores/           — Zustand stores (useAppStore, useSettingsStore)
-  hooks/            — useTauriCommands, useBotEvents (Tauri event listener)
-  lib/              — types.ts, constants.ts, utils.ts
+  pages/                 — Dashboard, Settings, TradeHistory
+  components/            — UI components (dashboard/, layout/, charts/, orb/, settings/, ui/)
+  stores/                — Zustand stores (useAppStore, useSettingsStore)
+  hooks/                 — useTauriCommands, useBotEvents (Tauri event listener)
+  lib/                   — types.ts, constants.ts, utils.ts
 ```
 
-## Key Conventions
+## Signal Pipeline
 
-### Rust
-- Async runtime: tokio (engine runs on spawned tasks)
-- Engine emits events via `app_handle.emit()` — frontend listens via `@tauri-apps/api/event`
-- All types in `models.rs` derive `Serialize, Deserialize, Clone, Debug`
-- Error handling: `EngineError` enum in `engine/error.rs` — errors are logged, never crash the tick loop
-- `tauri::Emitter` must be imported where `.emit()` is called
-- Credentials are AES-256-GCM encrypted at rest, decrypted only at moment of use
+```
+Price Data → 15+ Indicators → 10 Strategies vote → Signal Aggregator (weighted consensus)
+                                                          ↑
+Cross-Pair Correlation (divergence detection) ────────────┘
+Sentiment (Grok/Twitter + Reddit + News) ─────────────────┘
+Market Regime (ETH trend filter) ─────────────────────────┘
+                                                          ↓
+                                              Claude Trading Brain (final judge)
+                                                          ↓
+                                              Risk Manager → Paper/Live Executor → DB
+```
 
-### TypeScript/React
-- State management: Zustand (no Redux)
-- UI components: shadcn/ui + Tailwind CSS + Framer Motion
-- Theme: holographic dark (`holo-*` color tokens in index.css)
-- `tauriAvailable()` / `isTauri()` guards for browser dev fallback
-- Event types mirror Rust models: `LogEvent`, `StateChangeEvent`, `TickEvent`
-
-### Exchange Integration
-- Jupiter: REST API at api.jup.ag (Price V2 + Quote V6 + Swap V1)
-- Uniswap: TBD (Trading API or direct RPC)
-- Kalshi: REST API with API key auth
-- Token mint addresses mapped in `data_provider/jupiter.rs`
+## Key Environment Variables
+- `ANTHROPIC_API_KEY` — Enables Claude AI evaluator + Trading Brain
+- `XAI_API_KEY` or `GROK_API_KEY` — Enables Twitter/X sentiment via Grok
+- Both optional: bot works with TA-only if not set
 
 ## Build & Run
 ```bash
-# Frontend dev (browser mode, no Tauri)
-npm run dev
-
-# Desktop app (Tauri)
-npm run tauri dev
-
-# Type checks
-npx tsc --noEmit          # TypeScript
-cd src-tauri && cargo check  # Rust
+npm run dev              # Frontend browser mode (mock data)
+npm run tauri dev        # Desktop app (real engine)
+npx tsc --noEmit         # TypeScript check
+cd src-tauri && cargo check  # Rust check
 ```
-
-## Current State
-- Phase 1-2 complete: Engine skeleton, Jupiter live price feeds, candle builder, TA indicators, EMA crossover strategy, event bus to frontend
-- Phase 5-6 in progress: Risk manager, order manager, paper executor
-- Phases 7-9 pending: Uniswap/Kalshi providers, live executors, frontend polish
 
 ## Rules
 - NEVER log or serialize private keys, wallet keys, or API secrets
-- Paper mode is the default — live executors must check `paper_mode == true` and refuse to execute
-- All trades must pass through RiskManager pre-flight checks before execution
-- Circuit breakers (MaxDrawdown, StoplossGuard) can halt all trading — this is intentional safety
-- Keep mock data fallbacks in frontend for browser dev mode
+- Paper mode is default — live executors MUST check paper_mode before executing
+- All trades pass through RiskManager pre-flight checks
+- Circuit breakers can halt all trading — this is intentional safety
+- Claude Brain is the FINAL judge when configured — it can veto any trade
+- Brain adapts: raises confidence threshold after losing streaks
+- Sentiment analysis caches for 5 minutes to avoid API spam
 - User is US-based — only non-KYC, US-accessible exchanges

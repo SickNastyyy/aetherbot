@@ -20,6 +20,7 @@ use tauri::Emitter;
 use crate::database::{self, Database};
 use crate::models::*;
 use aggregator::SignalAggregator;
+use ai::brain::TradingBrain;
 use ai::evaluator::{ClaudeEvaluator, ClaudeEvaluatorConfig};
 use correlation::CorrelationEngine;
 use sentiment::SentimentEngine;
@@ -196,15 +197,17 @@ async fn run_tick_loop(
         api_key: claude_api_key.clone(),
         ..Default::default()
     });
+    let mut trading_brain = TradingBrain::new(claude_api_key.clone());
+
     if claude_evaluator.is_configured() {
         let _ = app_handle.emit("bot:log", LogEvent {
             level: "success".into(),
-            message: "Claude AI evaluator enabled — will analyze markets every 60s".into(),
+            message: "Claude Trading Brain enabled — AI will judge all trade decisions".into(),
         });
     } else {
         let _ = app_handle.emit("bot:log", LogEvent {
             level: "info".into(),
-            message: "Claude AI evaluator not configured (set ANTHROPIC_API_KEY to enable)".into(),
+            message: "Claude AI not configured (set ANTHROPIC_API_KEY to enable AI brain)".into(),
         });
     }
 
@@ -485,6 +488,9 @@ async fn run_tick_loop(
             if let Some((closed_pos, pnl)) = order_manager.close_position(pos_id, current_price, exit_reason) {
                 if matches!(exit_reason, ExitReason::StopLoss) {
                     risk_manager.record_stop_loss(&cfg);
+                    trading_brain.record_outcome(false);
+                } else if matches!(exit_reason, ExitReason::TakeProfit) {
+                    trading_brain.record_outcome(true);
                 }
 
                 // Persist close to database
@@ -548,6 +554,53 @@ async fn run_tick_loop(
                 });
 
                 if let Some(((intent, strat_name), agg)) = trade_decision {
+                    let current_price = match prices.get(pair.as_str()) {
+                        Some(&p) => p,
+                        None => continue,
+                    };
+
+                    // Claude Trading Brain: final judge on trade decisions
+                    // Only invoked when aggregator produces consensus (saves API costs)
+                    if trading_brain.is_configured() {
+                        let token = pair.split('/').next().unwrap_or(pair);
+                        let cached_sentiment = sentiment_engine.get_cached(token);
+
+                        let brain_decision = trading_brain.decide(
+                            pair, &intent.exchange, current_price,
+                            Some(&agg),
+                            &signal.indicators,
+                            cached_sentiment,
+                            &correlation_signals,
+                            market_regime,
+                        ).await;
+
+                        match brain_decision {
+                            Some(decision) if decision.action == "HOLD" => {
+                                let _ = app_handle.emit("bot:log", LogEvent {
+                                    level: "info".into(),
+                                    message: format!(
+                                        "[Brain] HOLD on {} — {} (risks: {})",
+                                        pair, decision.reasoning, decision.risk_notes
+                                    ),
+                                });
+                                continue; // Brain says no trade
+                            }
+                            Some(decision) => {
+                                let _ = app_handle.emit("bot:log", LogEvent {
+                                    level: "info".into(),
+                                    message: format!(
+                                        "[Brain] {} {} at {:.0}% — {}",
+                                        decision.action, pair,
+                                        decision.confidence * 100.0, decision.reasoning
+                                    ),
+                                });
+                                // Brain approved — continue to risk check
+                            }
+                            None => {
+                                // Brain unavailable or below threshold — fall through to TA-only
+                            }
+                        }
+                    }
                     // Regime filter: block longs in bear market, shorts in bull market
                     // (skip for Kalshi — prediction markets aren't correlated the same way)
                     if signal.exchange != "Kalshi" && market_regime != regime::MarketRegime::Unknown {
@@ -568,10 +621,6 @@ async fn run_tick_loop(
                             continue;
                         }
                     }
-                    let current_price = match prices.get(pair.as_str()) {
-                        Some(&p) => p,
-                        None => continue,
-                    };
 
                     match risk_manager.pre_flight_check(
                         pair,
