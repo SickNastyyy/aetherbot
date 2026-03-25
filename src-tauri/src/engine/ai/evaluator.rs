@@ -25,7 +25,7 @@ impl Default for ClaudeEvaluatorConfig {
     fn default() -> Self {
         Self {
             api_key: String::new(),
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6-20250514".to_string(),
             min_confidence: 0.70,
         }
     }
@@ -70,14 +70,15 @@ impl ClaudeEvaluator {
         }
 
         // Build market context for Claude
-        let recent_closes: Vec<f64> = candles.iter().rev().take(20).map(|c| c.close).collect();
-        let price_change_1h = if recent_closes.len() >= 60 {
-            ((recent_closes[0] - recent_closes[59]) / recent_closes[59]) * 100.0
-        } else {
+        let recent_closes: Vec<f64> = candles.iter().rev().take(60).map(|c| c.close).collect();
+        let price_change = if recent_closes.len() >= 2 {
             ((recent_closes[0] - recent_closes[recent_closes.len() - 1])
                 / recent_closes[recent_closes.len() - 1])
                 * 100.0
+        } else {
+            0.0
         };
+        let change_period = format!("{}m", recent_closes.len());
 
         let rsi = indicators.get("rsi").copied().unwrap_or(50.0);
         let ema_fast = indicators.get("ema_fast").copied().unwrap_or(0.0);
@@ -91,7 +92,7 @@ impl ClaudeEvaluator {
 
 Market: {pair} on {exchange}
 Current Price: ${current_price:.4}
-Recent Price Change: {price_change_1h:.2}%
+Price Change ({change_period}): {price_change:.2}%
 
 Technical Indicators:
 - RSI(14): {rsi:.1}

@@ -37,12 +37,12 @@ impl MarketRegime {
 
 /// Determine the current market regime from BTC/ETH candle data.
 /// Uses EMA-50 and EMA-200 on the reference asset.
-pub fn detect_regime(btc_candles: &[Candle]) -> MarketRegime {
-    if btc_candles.len() < 200 {
+pub fn detect_regime(reference_candles: &[Candle]) -> MarketRegime {
+    if reference_candles.len() < 200 {
         return MarketRegime::Unknown;
     }
 
-    let closes: Vec<f64> = btc_candles.iter().map(|c| c.close).collect();
+    let closes: Vec<f64> = reference_candles.iter().map(|c| c.close).collect();
 
     let ema_50 = match indicators::ema(&closes, 50) {
         Some(v) => *v.last().unwrap(),

@@ -1,4 +1,4 @@
-import { useId, useMemo, useRef, useEffect, useCallback } from 'react'
+import { useId, useMemo, useRef, useEffect, useCallback, useState } from 'react'
 import { AreaChart, Area, XAxis, YAxis, CartesianGrid, ResponsiveContainer, Tooltip } from 'recharts'
 import { useAppStore } from '@/stores/useAppStore'
 
@@ -12,11 +12,19 @@ export function ChartPlaceholder() {
   const { selectedPair, livePrices, botState } = useAppStore()
   const dataRef = useRef<PricePoint[]>([])
   const lastPriceRef = useRef<number | null>(null)
+  const [renderTick, setRenderTick] = useState(0)
 
   // Get live price for selected pair
   const livePrice = livePrices[selectedPair]
 
-  // Push live price into rolling data array
+  // Reset data when pair changes
+  useEffect(() => {
+    dataRef.current = []
+    lastPriceRef.current = null
+    setRenderTick(0)
+  }, [selectedPair])
+
+  // Push live price into rolling data array + trigger re-render
   const pushPrice = useCallback((price: number) => {
     const now = new Date()
     const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
@@ -25,6 +33,7 @@ export function ChartPlaceholder() {
       { time: timeStr, price },
     ]
     lastPriceRef.current = price
+    setRenderTick((n) => n + 1)
   }, [])
 
   // Push live price on each update

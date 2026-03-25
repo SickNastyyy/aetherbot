@@ -26,7 +26,7 @@ interface AppState {
 
   addLogEntry: (entry: Omit<TradeLogEntry, 'id' | 'timestamp'>) => void
   setSelectedPair: (pair: string) => void
-  setActivePage: (page: 'dashboard' | 'settings') => void
+  setActivePage: (page: 'dashboard' | 'settings' | 'history') => void
   incrementUptime: () => void
 
   startBot: () => void

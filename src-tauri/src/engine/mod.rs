@@ -228,7 +228,7 @@ async fn run_tick_loop(
 
     // Load candle history from database on startup
     {
-        let conn = db.conn.lock().unwrap();
+        let conn = db.conn.lock().unwrap_or_else(|p| p.into_inner());
         for exc in EXCHANGES {
             for pair in exc.pairs {
                 let key = format!("{}:{}", exc.name, pair);
@@ -303,7 +303,7 @@ async fn run_tick_loop(
                         if let Some(builder) = candle_builders.get_mut(&key) {
                             if let Some(candle) = builder.push_tick(tick.price, tick.volume, tick.timestamp) {
                                 // Persist candle to database
-                                if let Ok(conn) = db.conn.lock() {
+                                if let Ok(conn) = db.conn.lock().or_else(|p| Ok::<_, ()>(p.into_inner())) {
                                     let _ = database::insert_candle(
                                         &conn, exc.name, pair, &candle.timeframe,
                                         candle.open, candle.high, candle.low, candle.close,
@@ -494,7 +494,7 @@ async fn run_tick_loop(
                 }
 
                 // Persist close to database
-                if let Ok(conn) = db.conn.lock() {
+                if let Ok(conn) = db.conn.lock().or_else(|p| Ok::<_, ()>(p.into_inner())) {
                     let pnl_pct = if closed_pos.entry_price > 0.0 {
                         (pnl / (closed_pos.entry_price * closed_pos.quantity)) * 100.0
                     } else { 0.0 };
@@ -575,17 +575,7 @@ async fn run_tick_loop(
                         ).await;
 
                         match brain_decision {
-                            Some(decision) if decision.action == "HOLD" => {
-                                let _ = app_handle.emit("bot:log", LogEvent {
-                                    level: "info".into(),
-                                    message: format!(
-                                        "[Brain] HOLD on {} — {} (risks: {})",
-                                        pair, decision.reasoning, decision.risk_notes
-                                    ),
-                                });
-                                continue; // Brain says no trade
-                            }
-                            Some(decision) => {
+                            Some(decision) if decision.action == "LONG" || decision.action == "SHORT" => {
                                 let _ = app_handle.emit("bot:log", LogEvent {
                                     level: "info".into(),
                                     message: format!(
@@ -595,6 +585,17 @@ async fn run_tick_loop(
                                     ),
                                 });
                                 // Brain approved — continue to risk check
+                            }
+                            Some(decision) => {
+                                // HOLD, WAIT, or any other action = no trade
+                                let _ = app_handle.emit("bot:log", LogEvent {
+                                    level: "info".into(),
+                                    message: format!(
+                                        "[Brain] {} on {} — {} (risks: {})",
+                                        decision.action, pair, decision.reasoning, decision.risk_notes
+                                    ),
+                                });
+                                continue;
                             }
                             None => {
                                 // Brain unavailable or below threshold — fall through to TA-only
@@ -642,7 +643,7 @@ async fn run_tick_loop(
 
                             // Persist trade to database
                             if let Some(pos) = order_manager.positions().last() {
-                                if let Ok(conn) = db.conn.lock() {
+                                if let Ok(conn) = db.conn.lock().or_else(|p| Ok::<_, ()>(p.into_inner())) {
                                     let side_str = match approved.side { Side::Long => "LONG", Side::Short => "SHORT" };
                                     let _ = database::insert_trade(
                                         &conn, &pos.id, &approved.exchange, pair, side_str,
@@ -692,7 +693,7 @@ async fn run_tick_loop(
 
         // ── 6. Periodic portfolio snapshot ───────────────────────────────
         if tick_count % 60 == 0 {
-            if let Ok(conn) = db.conn.lock() {
+            if let Ok(conn) = db.conn.lock().or_else(|p| Ok::<_, ()>(p.into_inner())) {
                 let _ = database::insert_portfolio_snapshot(
                     &conn,
                     &chrono::Utc::now().to_rfc3339(),

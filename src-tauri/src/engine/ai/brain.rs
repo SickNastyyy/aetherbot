@@ -62,7 +62,7 @@ impl TradingBrain {
                 .build()
                 .expect("Failed to build HTTP client"),
             api_key,
-            model: "claude-sonnet-4-20250514".to_string(),
+            model: "claude-sonnet-4-6-20250514".to_string(),
             min_confidence: 0.65,
             performance: RecentPerformance::new(),
         }

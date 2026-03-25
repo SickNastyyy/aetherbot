@@ -85,24 +85,24 @@ impl KalshiProvider {
         // Use the first open market's last_price or yes_ask
         let market = &markets[0];
 
-        // Try last_price first, then yes_ask, then yes_bid
-        let price_str = market["last_price_dollars"]
-            .as_str()
-            .or_else(|| market["yes_ask_dollars"].as_str())
-            .or_else(|| market["yes_bid_dollars"].as_str())
+        // Kalshi v2 returns prices as integer cents (e.g., 42 = $0.42)
+        let price_cents = market["last_price"]
+            .as_i64()
+            .or_else(|| market["yes_ask"].as_i64())
+            .or_else(|| market["yes_bid"].as_i64())
+            // Fallback: try string-format dollar fields (some endpoints)
+            .or_else(|| {
+                market["last_price_dollars"].as_str()
+                    .and_then(|s| s.parse::<f64>().ok())
+                    .map(|d| (d * 100.0) as i64)
+            })
             .ok_or_else(|| EngineError::DataFetch {
                 exchange: "Kalshi".into(),
                 pair: event.into(),
                 msg: "No price found in market data".into(),
             })?;
 
-        let price: f64 = price_str.parse().map_err(|_| EngineError::DataFetch {
-            exchange: "Kalshi".into(),
-            pair: event.into(),
-            msg: format!("Invalid price value: {price_str}"),
-        })?;
-
-        Ok(price)
+        Ok(price_cents as f64 / 100.0)
     }
 }
 
