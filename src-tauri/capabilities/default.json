@@ -1,0 +1,14 @@
+{
+  "$schema": "https://raw.githubusercontent.com/nicegui-org/nicegui/main/nicegui/static/tauri/capabilities-schema.json",
+  "identifier": "default",
+  "description": "Default capabilities for AetherBot",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    {
+      "identifier": "core:window:allow-set-title",
+      "allow": [{ "title": "AetherBot*" }]
+    }
+  ]
+}
