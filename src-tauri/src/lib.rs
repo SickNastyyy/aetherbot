@@ -12,6 +12,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 pub type EngineState = Arc<Mutex<Option<BotEngine>>>;
+pub type JupiterState = commands::JupiterState;
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
@@ -25,6 +26,7 @@ pub fn run() {
     tauri::Builder::default()
         .manage(db)
         .manage(Arc::new(Mutex::new(None::<BotEngine>)) as EngineState)
+        .manage(Arc::new(Mutex::new(None)) as JupiterState)
         .invoke_handler(tauri::generate_handler![
             save_exchange_credentials,
             get_exchange_credentials,
@@ -38,6 +40,14 @@ pub fn run() {
             get_bot_state,
             get_trade_history,
             run_backtest,
+            jupiter_get_config,
+            jupiter_save_config,
+            jupiter_quote_swap,
+            jupiter_approve_ticket,
+            jupiter_execute_approved,
+            jupiter_kill_switch,
+            jupiter_get_audit_log,
+            jupiter_list_tickets,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

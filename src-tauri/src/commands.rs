@@ -1,9 +1,15 @@
 use crate::config;
 use crate::database::Database;
+use crate::engine::jupiter::config::JupiterSwapConfig;
+use crate::engine::jupiter::swap::SwapOrchestrator;
+use crate::engine::jupiter::ticket::SwapTicket;
 use crate::engine::BotEngine;
 use crate::models::*;
+use crate::paths;
 use crate::EngineState;
 use std::sync::Arc;
+
+pub type JupiterState = Arc<tokio::sync::Mutex<Option<SwapOrchestrator>>>;
 
 const ALLOWED_EXCHANGES: &[&str] = &["Jupiter", "Uniswap", "Kalshi"];
 const MAX_KEY_LENGTH: usize = 256;
@@ -211,5 +217,145 @@ pub async fn get_bot_state(
     match engine_lock.as_ref() {
         Some(engine) => Ok(engine.state().await),
         None => Ok(BotEngineState::Idle),
+    }
+}
+
+// ── Jupiter live swap commands ────────────────────────────────────────────────
+
+#[tauri::command]
+pub fn jupiter_get_config() -> Result<JupiterSwapConfig, String> {
+    let data_dir = paths::get_data_dir()?;
+    JupiterSwapConfig::load(&data_dir)
+}
+
+#[tauri::command]
+pub fn jupiter_save_config(config: JupiterSwapConfig) -> Result<(), String> {
+    // Validate hard limits before saving
+    if config.account_cap_usd > 250.0 {
+        return Err(format!(
+            "account_cap_usd {:.2} exceeds hard maximum of $250. \
+             Raise this only if you have explicitly reviewed the risk.",
+            config.account_cap_usd
+        ));
+    }
+    if config.max_swap_pct > 100.0 || config.max_swap_pct <= 0.0 {
+        return Err("max_swap_pct must be 0–100".into());
+    }
+    if config.max_slippage_bps > 1000 {
+        return Err("max_slippage_bps must be ≤ 1000 (10%)".into());
+    }
+    let data_dir = paths::get_data_dir()?;
+    config.save(&data_dir)
+}
+
+/// Step 1 + 2: Fetch a quote and run all safety gates.
+/// Returns a SwapTicket for the owner to review. Does NOT sign or submit.
+#[tauri::command]
+pub async fn jupiter_quote_swap(
+    input_mint: String,
+    output_mint: String,
+    in_amount: u64,
+    sol_price_usd: f64,
+    jup_state: tauri::State<'_, JupiterState>,
+    db: tauri::State<'_, Database>,
+) -> Result<SwapTicket, String> {
+    let mut lock = jup_state.lock().await;
+
+    // Lazily create the orchestrator on first use
+    if lock.is_none() {
+        let data_dir = paths::get_data_dir()?;
+        let config = JupiterSwapConfig::load(&data_dir)?;
+        let db_path = data_dir.join("trades.db");
+        let conn = rusqlite::Connection::open(&db_path)
+            .map_err(|e| format!("DB open: {e}"))?;
+        let arc_db = Arc::new(Database { conn: std::sync::Mutex::new(conn) });
+        *lock = Some(SwapOrchestrator::new(config, arc_db));
+    }
+
+    let orchestrator = lock.as_ref().unwrap();
+    orchestrator
+        .create_ticket(&input_mint, &output_mint, in_amount, sol_price_usd)
+        .await
+}
+
+/// Step 3: Owner explicitly approves the ticket (behind UI password check).
+/// Returns the updated ticket. Does NOT submit.
+#[tauri::command]
+pub async fn jupiter_approve_ticket(
+    ticket_id: String,
+    jup_state: tauri::State<'_, JupiterState>,
+) -> Result<SwapTicket, String> {
+    let lock = jup_state.lock().await;
+    let orchestrator = lock
+        .as_ref()
+        .ok_or("Jupiter orchestrator not initialised — call jupiter_quote_swap first")?;
+    orchestrator.approve_ticket(&ticket_id)
+}
+
+/// Steps 4–8: Execute an already-approved ticket.
+/// Simulate → sign → submit → confirm → reconcile.
+/// On timeout or unknown result: marks PENDING, never resubmits.
+#[tauri::command]
+pub async fn jupiter_execute_approved(
+    ticket_id: String,
+    jup_state: tauri::State<'_, JupiterState>,
+) -> Result<SwapTicket, String> {
+    let lock = jup_state.lock().await;
+    let orchestrator = lock
+        .as_ref()
+        .ok_or("Jupiter orchestrator not initialised")?;
+    orchestrator.execute_approved(&ticket_id).await
+}
+
+/// One command that blocks all new swap tickets immediately.
+#[tauri::command]
+pub async fn jupiter_kill_switch(
+    activate: bool,
+    jup_state: tauri::State<'_, JupiterState>,
+) -> Result<(), String> {
+    let lock = jup_state.lock().await;
+    if let Some(orchestrator) = lock.as_ref() {
+        if activate {
+            orchestrator.kill_switch().activate();
+        } else {
+            orchestrator.kill_switch().deactivate();
+        }
+        Ok(())
+    } else {
+        // Even if orchestrator isn't running, return Ok — the switch concept is acknowledged
+        Ok(())
+    }
+}
+
+/// Return the Jupiter audit log (most recent first).
+#[tauri::command]
+pub async fn jupiter_get_audit_log(
+    limit: u32,
+    jup_state: tauri::State<'_, JupiterState>,
+) -> Result<Vec<crate::database::JupiterAuditRow>, String> {
+    let lock = jup_state.lock().await;
+    let orchestrator = lock
+        .as_ref()
+        .ok_or("Jupiter orchestrator not initialised")?;
+
+    // Access audit log via the ticket store's underlying db
+    // We re-open the DB for simplicity (avoids exposing AuditLedger from SwapOrchestrator)
+    let data_dir = paths::get_data_dir()?;
+    let db_path = data_dir.join("trades.db");
+    let conn = rusqlite::Connection::open(&db_path)
+        .map_err(|e| format!("DB open: {e}"))?;
+    crate::database::get_jupiter_audit_log(&conn, limit)
+        .map_err(|e| format!("DB error: {e}"))
+}
+
+/// List all in-flight tickets (for dashboard display).
+#[tauri::command]
+pub async fn jupiter_list_tickets(
+    jup_state: tauri::State<'_, JupiterState>,
+) -> Result<Vec<SwapTicket>, String> {
+    let lock = jup_state.lock().await;
+    match lock.as_ref() {
+        Some(o) => o.ticket_store().all(),
+        None => Ok(vec![]),
     }
 }

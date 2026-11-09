@@ -1,4 +1,5 @@
 pub mod aggregator;
+pub mod jupiter;
 pub mod ai;
 pub mod backtest;
 pub mod correlation;
