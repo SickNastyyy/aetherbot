@@ -698,6 +698,7 @@ fn ticket_status_pending_means_no_resubmit() {
         unsigned_tx_b64: None,
         created_at_ts: chrono::Utc::now().timestamp(),
         sol_price_usd_at_quote: 150.0,
+        request_id: None,
     };
 
     // A PENDING ticket must NOT be re-submitted — only reconciled

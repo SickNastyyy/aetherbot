@@ -2,7 +2,7 @@ use crate::config;
 use crate::database::Database;
 use crate::engine::jupiter::config::JupiterSwapConfig;
 use crate::engine::jupiter::swap::SwapOrchestrator;
-use crate::engine::jupiter::ticket::SwapTicket;
+use crate::engine::jupiter::ticket::{SwapTicket, TicketStatus};
 use crate::engine::BotEngine;
 use crate::models::*;
 use crate::paths;
@@ -237,8 +237,31 @@ pub async fn jupiter_save_config(
     config.validate()?;
     let data_dir = paths::get_data_dir()?;
     config.save(&data_dir)?;
-    // Reset the orchestrator so the new config is picked up on the next call
-    *jup_state.lock().await = None;
+
+    // Reset the orchestrator so new config takes effect — but only if there are
+    // no in-flight tickets. Resetting would silently discard pending/approved/submitted
+    // tickets, which could leave swaps in an unreconcilable state.
+    let mut lock = jup_state.lock().await;
+    if let Some(orch) = lock.as_ref() {
+        let in_flight = orch.ticket_store().all()?.iter().any(|t| {
+            matches!(
+                t.status,
+                TicketStatus::PendingApproval
+                    | TicketStatus::Approved
+                    | TicketStatus::Simulated
+                    | TicketStatus::Submitted { .. }
+            )
+        });
+        if in_flight {
+            return Err(
+                "Config saved to disk but NOT applied to the running orchestrator: \
+                 there are in-flight tickets. Wait for them to complete or fail, \
+                 then save again to reload."
+                    .into(),
+            );
+        }
+    }
+    *lock = None;
     Ok(())
 }
 

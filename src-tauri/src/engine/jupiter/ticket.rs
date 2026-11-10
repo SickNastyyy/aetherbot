@@ -48,6 +48,8 @@ pub struct SwapTicket {
     pub created_at_ts: i64,
     /// SOL price at quote time — used for gate re-run at execute time.
     pub sol_price_usd_at_quote: f64,
+    /// Jupiter requestId from /order — required for /execute endpoint.
+    pub request_id: Option<String>,
 }
 
 impl SwapTicket {
@@ -78,6 +80,7 @@ impl SwapTicket {
             unsigned_tx_b64: quote.unsigned_tx_b64.clone(),
             created_at_ts: now.timestamp(),
             sol_price_usd_at_quote: sol_price_usd,
+            request_id: quote.request_id.clone(),
         }
     }
 

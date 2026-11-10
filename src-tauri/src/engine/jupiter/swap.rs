@@ -34,13 +34,14 @@ pub struct SwapOrchestrator {
     daily_stop: DailyStopTracker,
     ticket_store: Arc<TicketStore>,
     audit: AuditLedger,
+    db: Arc<crate::database::Database>,
 }
 
 impl SwapOrchestrator {
     pub fn new(config: JupiterSwapConfig, db: Arc<Database>) -> Self {
         let wallet_reader = WalletReader::new(config.rpc_url.clone());
         let daily_stop = DailyStopTracker::new(db.clone());
-        let audit = AuditLedger::new(db);
+        let audit = AuditLedger::new(db.clone());
         Self {
             config,
             quote_client: JupiterQuoteClient::new(),
@@ -49,6 +50,7 @@ impl SwapOrchestrator {
             daily_stop,
             ticket_store: Arc::new(TicketStore::new()),
             audit,
+            db,
         }
     }
 
@@ -199,12 +201,25 @@ impl SwapOrchestrator {
             return Err("Kill switch is active".into());
         }
 
-        // 3b. Re-run all gates with FRESH balances at execute time
+        // 3b. Re-run all gates with FRESH balances at execute time.
+        // Also capture pre-swap output balance so we can compute the actual output delta.
         let fresh_balances = self
             .wallet_reader
             .read_balances(&self.config.wallet_public_key, ticket.sol_price_usd_at_quote)
             .await
             .map_err(|e| format!("Wallet re-read at execute time failed: {e}"))?;
+
+        // Pre-swap output balance (SOL or token), used to compute delta after confirmation.
+        let pre_output_atoms: u64 = if ticket.output_mint == super::config::SOL_MINT {
+            fresh_balances.sol_lamports
+        } else {
+            fresh_balances
+                .token_accounts
+                .iter()
+                .find(|t| t.mint == ticket.output_mint)
+                .map(|t| t.amount_atoms)
+                .unwrap_or(0)
+        };
 
         let (start_equity, daily_stop_blocked) = self.daily_stop.state()?;
         let now_ts = chrono::Utc::now().timestamp();
@@ -322,19 +337,50 @@ impl SwapOrchestrator {
                 format!("Signer refused: {e}")
             })?;
 
-        // 6. Submit — maxRetries=0, never resubmit on unknown
-        let signature = match self.wallet_reader.send_transaction(&signed_tx_b64).await {
-            Ok(sig) => sig,
-            Err(e) => {
-                let _ = self.audit.record_unknown(ticket_id);
-                // The tx may or may not have landed — record the empty-sig PENDING
+        // 6. Final kill switch check right before submitting.
+        // This catches a kill switch activated during simulation/signing.
+        {
+            let conn = self
+                .db
+                .conn
+                .lock()
+                .map_err(|e| format!("DB lock before submit: {e}"))?;
+            if crate::database::get_kill_switch(&conn)
+                .map_err(|e| format!("DB kill switch check: {e}"))?
+            {
                 let _ = self.ticket_store.update_status(
                     ticket_id,
-                    TicketStatus::Pending { signature: String::new() },
+                    TicketStatus::Rejected { reason: "Kill switch activated before submit".into() },
                 );
-                return Err(format!(
-                    "Submission failed — marked PENDING, do not resubmit: {e}"
-                ));
+                return Err("Kill switch activated — not submitting".into());
+            }
+        }
+
+        // 6b. Submit via Jupiter /execute (required for RFQ/gasless quotes).
+        // Falls back to direct RPC sendTransaction only when no request_id is present.
+        let signature = match self
+            .quote_client
+            .execute_swap(&signed_tx_b64, ticket.request_id.as_deref())
+            .await
+        {
+            Ok(sig) => sig,
+            Err(jup_err) => {
+                // If /execute fails, fall back to direct RPC submission
+                match self.wallet_reader.send_transaction(&signed_tx_b64).await {
+                    Ok(sig) => sig,
+                    Err(rpc_err) => {
+                        // Both paths failed — record as unknown PENDING
+                        let _ = self.audit.record_unknown(ticket_id);
+                        let _ = self.ticket_store.update_status(
+                            ticket_id,
+                            TicketStatus::Pending { signature: String::new() },
+                        );
+                        return Err(format!(
+                            "Submission failed (Jupiter: {jup_err}; RPC: {rpc_err}) — \
+                             marked PENDING, do not resubmit"
+                        ));
+                    }
+                }
             }
         };
 
@@ -360,13 +406,20 @@ impl SwapOrchestrator {
                     .await
                     .ok();
 
+                // Compute actual output as the DELTA (post minus pre), not the absolute balance.
                 let actual_output_atoms = post_balances
                     .as_ref()
-                    .and_then(|b| {
-                        b.token_accounts
-                            .iter()
-                            .find(|t| t.mint == ticket.output_mint)
-                            .map(|t| t.amount_atoms)
+                    .map(|post| {
+                        let post_atoms = if ticket.output_mint == super::config::SOL_MINT {
+                            post.sol_lamports
+                        } else {
+                            post.token_accounts
+                                .iter()
+                                .find(|t| t.mint == ticket.output_mint)
+                                .map(|t| t.amount_atoms)
+                                .unwrap_or(0)
+                        };
+                        post_atoms.saturating_sub(pre_output_atoms)
                     })
                     .unwrap_or(0);
 
@@ -411,9 +464,15 @@ impl SwapOrchestrator {
     }
 
     /// Resolve ALT accounts from a base64-encoded unsigned transaction.
-    /// For v0 transactions: fetches each referenced lookup table from the RPC
-    /// and returns the accounts in correct order (writable then readonly per ALT).
-    /// Returns an empty Vec for legacy transactions (no ALTs).
+    ///
+    /// Solana v0 account ordering (Solana source, message.rs):
+    ///   full_accounts = static_keys
+    ///                 + [all writable from ALT₀, ALT₁, ...]
+    ///                 + [all readonly from ALT₀, ALT₁, ...]
+    ///
+    /// A per-ALT interleave (writable₀, readonly₀, writable₁, readonly₁) is WRONG
+    /// for 2+ ALTs and would cause the signer to verify different accounts than the
+    /// validator loads — returns empty Vec for legacy (non-v0) transactions.
     async fn resolve_alt_accounts(&self, unsigned_tx_b64: &str) -> Result<Vec<[u8; 32]>, String> {
         let tx_bytes = base64::Engine::decode(
             &base64::engine::general_purpose::STANDARD,
@@ -421,14 +480,14 @@ impl SwapOrchestrator {
         )
         .map_err(|e| format!("Base64 decode for ALT resolution: {e}"))?;
 
-        // Quick parse just to get ALT references
         let (_, alt_refs) = super::signer::parse_alts_for_resolve(&tx_bytes)?;
 
         if alt_refs.is_empty() {
             return Ok(vec![]);
         }
 
-        let mut resolved: Vec<[u8; 32]> = Vec::new();
+        // Fetch all tables first (async), then do two passes over the results.
+        let mut tables: Vec<(Vec<u8>, Vec<u8>, Vec<[u8; 32]>)> = Vec::new();
         for (table_address, writable_indices, readonly_indices) in alt_refs {
             let table_b58 = bs58::encode(&table_address).into_string();
             let table_accounts = self
@@ -436,21 +495,32 @@ impl SwapOrchestrator {
                 .get_lookup_table_addresses(&table_b58)
                 .await
                 .map_err(|e| format!("Failed to resolve ALT {table_b58}: {e}"))?;
+            tables.push((writable_indices, readonly_indices, table_accounts));
+        }
 
-            for &idx in &writable_indices {
+        let mut resolved: Vec<[u8; 32]> = Vec::new();
+
+        // Pass 1: all writable accounts across all ALTs (in ALT order)
+        for (writable_indices, _, table_accounts) in &tables {
+            for &idx in writable_indices {
                 match table_accounts.get(idx as usize) {
                     Some(&acct) => resolved.push(acct),
                     None => return Err(format!(
-                        "ALT {table_b58}: writable index {idx} out of bounds (table has {} entries)",
+                        "ALT writable index {idx} out of bounds (table has {} entries)",
                         table_accounts.len()
                     )),
                 }
             }
-            for &idx in &readonly_indices {
+        }
+
+        // Pass 2: all readonly accounts across all ALTs (in ALT order)
+        for (_, readonly_indices, table_accounts) in &tables {
+            for &idx in readonly_indices {
                 match table_accounts.get(idx as usize) {
                     Some(&acct) => resolved.push(acct),
                     None => return Err(format!(
-                        "ALT {table_b58}: readonly index {idx} out of bounds",
+                        "ALT readonly index {idx} out of bounds (table has {} entries)",
+                        table_accounts.len()
                     )),
                 }
             }

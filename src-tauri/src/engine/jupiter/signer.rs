@@ -178,7 +178,18 @@ fn sign_internal(
     }
 
     // 8. Instruction semantic checks.
-    check_instruction_semantics(&parsed, num_static_keys, &all_keys_b58)?;
+    // Max SOL that can be transferred: in_amount (if input is SOL) + fee cap × 20 buffer.
+    let fee_cap_lamports = (ticket.priority_fee_cap_sol * 1_000_000_000.0) as u64;
+    let max_sol_transfer = {
+        let input_is_sol = ticket.expected_input_mint
+            == super::config::SOL_MINT;
+        if input_is_sol {
+            ticket.expected_in_amount.saturating_add(fee_cap_lamports.saturating_mul(20))
+        } else {
+            fee_cap_lamports.saturating_mul(20)
+        }
+    };
+    check_instruction_semantics(&parsed, num_static_keys, &all_keys_b58, max_sol_transfer)?;
 
     // 9. Check priority fee from Compute Budget instruction
     let priority_fee_lamports = extract_priority_fee_lamports(&parsed, &all_keys_b58);
@@ -492,16 +503,23 @@ fn extract_priority_fee_lamports(
 
 /// Check instruction semantics against known dangerous patterns.
 ///
-/// Blocks:
-/// - SPL Token / Token-2022: Approve (4), ApproveChecked (13), SetAuthority (6).
-///   These grant control over tokens to arbitrary third parties.
-/// - System Program Transfer where the destination is in an address lookup table
-///   (not static keys). Jupiter's normal wSOL wrapping always uses a static
-///   destination; an ALT-sourced destination is a drain indicator.
+/// Blocks (SPL Token / Token-2022):
+/// - Transfer (3): top-level token transfers should not appear in Jupiter bundles.
+/// - Approve (4): grants spending rights to a third party.
+/// - SetAuthority (6): transfers token account ownership.
+/// - CloseAccount (9): allowed ONLY when destination is the fee payer (index 0).
+/// - TransferChecked (12): same risk as Transfer.
+/// - ApproveChecked (13): same risk as Approve.
+///
+/// Blocks (System Program):
+/// - Transfer (discriminant 2) where:
+///   a. destination is ALT-sourced (not in static keys), OR
+///   b. lamports > max_sol_transfer (caps drain amount to authorized swap + fee buffer).
 fn check_instruction_semantics(
     parsed: &ParsedTransaction,
     num_static_keys: usize,
     all_keys_b58: &[String],
+    max_sol_transfer: u64,
 ) -> Result<(), String> {
     for inst in &parsed.instructions {
         let prog_b58 = all_keys_b58
@@ -512,18 +530,42 @@ fn check_instruction_semantics(
         if prog_b58 == SPL_TOKEN || prog_b58 == TOKEN_2022 {
             if !inst.data.is_empty() {
                 match inst.data[0] {
+                    3 => return Err(
+                        "SPL Token Transfer is not permitted as a top-level instruction \
+                         in a Jupiter swap"
+                            .into(),
+                    ),
                     4 => return Err(
-                        "SPL Token Approve instruction is not permitted — \
+                        "SPL Token Approve is not permitted — \
                          it grants spending rights to a third party"
                             .into(),
                     ),
                     6 => return Err(
-                        "SPL Token SetAuthority instruction is not permitted — \
+                        "SPL Token SetAuthority is not permitted — \
                          it transfers token account ownership"
                             .into(),
                     ),
+                    9 => {
+                        // CloseAccount: destination (account_indices[1]) must be the fee payer.
+                        // Fee payer is always full_accounts[0], so its index in the
+                        // account_indices array must be 0.
+                        if let Some(&dest_idx) = inst.account_indices.get(1) {
+                            if dest_idx != 0 {
+                                return Err(format!(
+                                    "SPL Token CloseAccount: destination account index {} is \
+                                     not the fee payer — refusing to sign",
+                                    dest_idx
+                                ));
+                            }
+                        }
+                    }
+                    12 => return Err(
+                        "SPL Token TransferChecked is not permitted as a top-level instruction \
+                         in a Jupiter swap"
+                            .into(),
+                    ),
                     13 => return Err(
-                        "SPL Token ApproveChecked instruction is not permitted".into(),
+                        "SPL Token ApproveChecked is not permitted".into(),
                     ),
                     _ => {}
                 }
@@ -534,13 +576,26 @@ fn check_instruction_semantics(
                 let discriminant =
                     u32::from_le_bytes(inst.data[..4].try_into().unwrap_or([0; 4]));
                 if discriminant == 2 {
-                    // Transfer — verify destination is in static accounts, not ALT
+                    // Check 1: destination must be in static accounts (not ALT).
                     if let Some(&dest_idx) = inst.account_indices.get(1) {
                         if (dest_idx as usize) >= num_static_keys {
                             return Err(format!(
                                 "System Program Transfer: destination account index {} is \
                                  sourced from an address lookup table — refusing to sign",
                                 dest_idx
+                            ));
+                        }
+                    }
+                    // Check 2: transfer amount must not exceed the authorized cap.
+                    // Layout: [0..4] discriminant, [4..12] lamports (u64 LE).
+                    if inst.data.len() >= 12 {
+                        let lamports = u64::from_le_bytes(
+                            inst.data[4..12].try_into().unwrap_or([0; 8]),
+                        );
+                        if lamports > max_sol_transfer {
+                            return Err(format!(
+                                "System Program Transfer of {lamports} lamports exceeds \
+                                 authorized cap of {max_sol_transfer} lamports"
                             ));
                         }
                     }

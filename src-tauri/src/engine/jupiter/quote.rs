@@ -76,6 +76,44 @@ impl JupiterQuoteClient {
         self.parse_quote_response(resp, input_mint, output_mint, in_amount, slippage_bps)
     }
 
+    /// POST /swap/v2/execute — submit a signed transaction through Jupiter.
+    /// Required for RFQ / market-maker quotes; preferred for all swaps.
+    /// Returns the transaction signature on success.
+    pub async fn execute_swap(
+        &self,
+        signed_tx_b64: &str,
+        request_id: Option<&str>,
+    ) -> Result<String, String> {
+        let url = format!("{}/execute", self.base_url);
+        let mut body = serde_json::json!({ "signedTransaction": signed_tx_b64 });
+        if let Some(rid) = request_id {
+            body["requestId"] = serde_json::Value::String(rid.to_string());
+        }
+        let resp: serde_json::Value = self
+            .client
+            .post(&url)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| format!("Jupiter /execute request failed: {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("Jupiter /execute parse failed: {e}"))?;
+
+        if let Some(err) = resp["error"].as_str() {
+            return Err(format!("Jupiter /execute error: {err}"));
+        }
+        if let Some(err) = resp["message"].as_str() {
+            if resp["error"].is_object() || resp["code"].is_number() {
+                return Err(format!("Jupiter /execute error: {err}"));
+            }
+        }
+        resp["signature"]
+            .as_str()
+            .map(|s| s.to_string())
+            .ok_or_else(|| format!("Jupiter /execute: no signature in response: {resp}"))
+    }
+
     fn parse_quote_response(
         &self,
         resp: serde_json::Value,
