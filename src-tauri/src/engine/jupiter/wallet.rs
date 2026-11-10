@@ -1,5 +1,6 @@
 use reqwest::Client;
 use serde_json::json;
+use bs58;
 
 // ── Types ────────────────────────────────────────────────────────────────────
 
@@ -137,10 +138,17 @@ impl WalletReader {
                         parsed["tokenAmount"]["amount"].as_str(),
                     ) {
                         let amount_atoms: u64 = amount_str.parse().unwrap_or(0);
+                        // Price USDC at $1 (6 decimals). All other tokens left as None.
+                        const USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+                        let amount_usd = if mint == USDC_MINT {
+                            Some(amount_atoms as f64 / 1_000_000.0)
+                        } else {
+                            None
+                        };
                         all_accounts.push(TokenAccountInfo {
                             mint: mint.to_string(),
                             amount_atoms,
-                            amount_usd: None,
+                            amount_usd,
                         });
                     }
                 }
@@ -150,12 +158,14 @@ impl WalletReader {
         Ok(all_accounts)
     }
 
-    /// Fetch the current confirmed slot (used for blockhash expiry checks).
-    pub async fn get_current_slot(&self) -> Result<u64, String> {
+    /// Fetch the current confirmed block height.
+    /// Used for blockhash expiry checks. `lastValidBlockHeight` from Jupiter
+    /// must be compared against block height, NOT slot.
+    pub async fn get_current_block_height(&self) -> Result<u64, String> {
         let req = json!({
             "jsonrpc": "2.0",
             "id": 1,
-            "method": "getSlot",
+            "method": "getBlockHeight",
             "params": [{"commitment": "confirmed"}]
         });
         let resp: serde_json::Value = self
@@ -164,14 +174,64 @@ impl WalletReader {
             .json(&req)
             .send()
             .await
-            .map_err(|e| format!("RPC getSlot: {e}"))?
+            .map_err(|e| format!("RPC getBlockHeight: {e}"))?
             .json()
             .await
             .map_err(|e| format!("RPC parse: {e}"))?;
 
         resp["result"]
             .as_u64()
-            .ok_or_else(|| "Missing slot in RPC response".into())
+            .ok_or_else(|| "Missing block height in RPC response — failing closed".into())
+    }
+
+    /// Fetch the full account list for a Solana address lookup table.
+    /// Returns the ordered list of pubkeys stored in the table.
+    /// Fails closed: if the RPC call fails or the account is not an ALT, returns Err.
+    pub async fn get_lookup_table_addresses(
+        &self,
+        table_address: &str,
+    ) -> Result<Vec<[u8; 32]>, String> {
+        let req = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "getAccountInfo",
+            "params": [
+                table_address,
+                {"encoding": "jsonParsed", "commitment": "confirmed"}
+            ]
+        });
+        let resp: serde_json::Value = self
+            .client
+            .post(&self.rpc_url)
+            .json(&req)
+            .send()
+            .await
+            .map_err(|e| format!("RPC getAccountInfo(ALT {table_address}): {e}"))?
+            .json()
+            .await
+            .map_err(|e| format!("RPC parse(ALT): {e}"))?;
+
+        let addresses = resp["result"]["value"]["data"]["parsed"]["info"]["addresses"]
+            .as_array()
+            .ok_or_else(|| {
+                format!("ALT {table_address}: not a parsed lookup table or account not found")
+            })?;
+
+        addresses
+            .iter()
+            .map(|v| {
+                let b58 = v.as_str().ok_or_else(|| "ALT address entry is not a string".to_string())?;
+                let bytes = bs58::decode(b58)
+                    .into_vec()
+                    .map_err(|e| format!("ALT address decode: {e}"))?;
+                if bytes.len() != 32 {
+                    return Err(format!("ALT address {b58} is not 32 bytes"));
+                }
+                let mut arr = [0u8; 32];
+                arr.copy_from_slice(&bytes);
+                Ok(arr)
+            })
+            .collect()
     }
 
     /// Check the status of a submitted transaction signature.

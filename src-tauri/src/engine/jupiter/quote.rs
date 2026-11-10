@@ -12,7 +12,8 @@ pub struct SwapQuote {
     /// Minimum output after slippage
     pub other_amount_threshold: u64,
     pub slippage_bps: u32,
-    /// Price impact as a percentage (0.0 – 100.0)
+    /// Price impact as a percentage (0.0 – 100.0).
+    /// Set to 100.0 (fail-closed) when the field is missing from the API response.
     pub price_impact_pct: f64,
     /// Estimated priority fee in lamports (from Jupiter response)
     pub priority_fee_lamports: u64,
@@ -22,6 +23,11 @@ pub struct SwapQuote {
     pub fetched_at: i64,
     /// Route description for display
     pub route_label: String,
+    /// Base64-encoded unsigned transaction from /order response (with taker set).
+    /// This is the EXACT transaction that will be verified and signed.
+    pub unsigned_tx_b64: Option<String>,
+    /// Request ID for the /execute endpoint (if provided by Jupiter).
+    pub request_id: Option<String>,
 }
 
 // ── JupiterQuoteClient ────────────────────────────────────────────────────────
@@ -96,11 +102,12 @@ impl JupiterQuoteClient {
         let other_amount_threshold = parse_u64_field(data, "otherAmountThreshold")
             .unwrap_or_else(|_| out_amount.saturating_sub(out_amount / 100));
 
+        // Fail closed: treat a missing/null price impact as 100% to block the swap.
         let price_impact_pct: f64 = data["priceImpactPct"]
             .as_str()
             .and_then(|s| s.parse().ok())
             .or_else(|| data["priceImpactPct"].as_f64())
-            .unwrap_or(0.0);
+            .unwrap_or(100.0);
 
         let priority_fee_lamports: u64 = data["prioritizationFeeLamports"]
             .as_u64()
@@ -118,6 +125,15 @@ impl JupiterQuoteClient {
             .unwrap_or("Jupiter")
             .to_string();
 
+        // The /order endpoint (with taker set) includes the unsigned transaction directly.
+        let unsigned_tx_b64 = resp["transaction"]
+            .as_str()
+            .map(|s| s.to_string());
+
+        let request_id = resp["requestId"]
+            .as_str()
+            .map(|s| s.to_string());
+
         Ok(SwapQuote {
             input_mint: input_mint.to_string(),
             output_mint: output_mint.to_string(),
@@ -130,64 +146,9 @@ impl JupiterQuoteClient {
             last_valid_block_height,
             fetched_at: chrono::Utc::now().timestamp(),
             route_label,
+            unsigned_tx_b64,
+            request_id,
         })
-    }
-
-    /// POST /swap/v2/swap — get the unsigned base64-encoded transaction for
-    /// the previously quoted swap. Called AFTER owner approval (step 4 in
-    /// the flow). Returns (base64_tx, last_valid_block_height).
-    pub async fn get_swap_transaction(
-        &self,
-        quote: &SwapQuote,
-        user_public_key: &str,
-        priority_fee_lamports: Option<u64>,
-    ) -> Result<(String, u64), String> {
-        let body = serde_json::json!({
-            "quoteResponse": {
-                "inputMint": quote.input_mint,
-                "inAmount": quote.in_amount.to_string(),
-                "outputMint": quote.output_mint,
-                "outAmount": quote.out_amount.to_string(),
-                "otherAmountThreshold": quote.other_amount_threshold.to_string(),
-                "swapMode": "ExactIn",
-                "slippageBps": quote.slippage_bps,
-                "priceImpactPct": quote.price_impact_pct.to_string(),
-                "routePlan": [],
-                "contextSlot": 0,
-                "timeTaken": 0.0
-            },
-            "userPublicKey": user_public_key,
-            "wrapAndUnwrapSol": true,
-            "computeUnitPriceMicroLamports": priority_fee_lamports.map(|f| f * 1_000).unwrap_or(1000),
-            "asLegacyTransaction": false
-        });
-
-        let url = format!("{}/swap", self.base_url);
-        let resp: serde_json::Value = self
-            .client
-            .post(&url)
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| format!("Jupiter swap request failed: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("Jupiter swap parse failed: {e}"))?;
-
-        if let Some(err) = resp["error"].as_str() {
-            return Err(format!("Jupiter swap API error: {err}"));
-        }
-
-        let tx_b64 = resp["swapTransaction"]
-            .as_str()
-            .ok_or_else(|| format!("Missing swapTransaction in Jupiter response: {resp}"))?
-            .to_string();
-
-        let last_valid = resp["lastValidBlockHeight"]
-            .as_u64()
-            .unwrap_or(quote.last_valid_block_height);
-
-        Ok((tx_b64, last_valid))
     }
 }
 

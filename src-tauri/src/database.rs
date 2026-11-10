@@ -106,6 +106,12 @@ pub fn init_database() -> Result<Database, String> {
             blocked INTEGER NOT NULL DEFAULT 0
         );
 
+        CREATE TABLE IF NOT EXISTS jupiter_kill_switch (
+            id INTEGER PRIMARY KEY CHECK (id = 1),
+            active INTEGER NOT NULL DEFAULT 0,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
         CREATE INDEX IF NOT EXISTS idx_jupiter_audit_swap_id ON jupiter_audit(swap_id);
         CREATE INDEX IF NOT EXISTS idx_jupiter_audit_signature ON jupiter_audit(signature);
         CREATE INDEX IF NOT EXISTS idx_jupiter_daily_stop_date ON jupiter_daily_stop(date);
@@ -429,6 +435,30 @@ pub fn get_jupiter_daily_stop(
         })
     })?;
     rows.next().transpose()
+}
+
+// ── Jupiter Kill Switch ─────────────────────────────────────────────────────
+
+pub fn set_kill_switch(conn: &Connection, active: bool) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "INSERT INTO jupiter_kill_switch (id, active, updated_at) VALUES (1, ?1, datetime('now'))
+         ON CONFLICT(id) DO UPDATE SET active = excluded.active, updated_at = excluded.updated_at",
+        params![active as i64],
+    )?;
+    Ok(())
+}
+
+pub fn get_kill_switch(conn: &Connection) -> Result<bool, rusqlite::Error> {
+    let result = conn.query_row(
+        "SELECT active FROM jupiter_kill_switch WHERE id = 1",
+        [],
+        |row| row.get::<_, i64>(0),
+    );
+    match result {
+        Ok(v) => Ok(v != 0),
+        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(false),
+        Err(e) => Err(e),
+    }
 }
 
 // ── Row types ───────────────────────────────────────────────────────────────

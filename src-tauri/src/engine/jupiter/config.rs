@@ -59,6 +59,8 @@ pub struct JupiterSwapConfig {
     /// Master execution switch. Defaults to false.
     /// Only enable after all other conditions are met.
     pub live_execution_enabled: bool,
+    /// Maximum seconds between ticket approval and execution. Default 30s.
+    pub ticket_ttl_secs: u64,
 }
 
 impl Default for JupiterSwapConfig {
@@ -79,6 +81,7 @@ impl Default for JupiterSwapConfig {
             priority_fee_cap_sol: 0.0005,
             signer_key_path: None,
             live_execution_enabled: false,
+            ticket_ttl_secs: 30,
         }
     }
 }
@@ -97,13 +100,42 @@ impl JupiterSwapConfig {
             && self.signer_key_path.is_some()
     }
 
+    /// Validate that all risk limits are within safe bounds.
+    /// Called on both save and load to prevent bypass via file edit.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.account_cap_usd <= 0.0 || self.account_cap_usd > 250.0 {
+            return Err(format!("account_cap_usd {:.2} must be 0–250", self.account_cap_usd));
+        }
+        if self.max_swap_pct <= 0.0 || self.max_swap_pct > 100.0 {
+            return Err("max_swap_pct must be 0–100".into());
+        }
+        if self.max_slippage_bps > 1000 {
+            return Err("max_slippage_bps must be ≤ 1000 (10%)".into());
+        }
+        if self.max_price_impact_pct <= 0.0 || self.max_price_impact_pct > 50.0 {
+            return Err("max_price_impact_pct must be 0–50".into());
+        }
+        if self.sol_reserve_usd < 0.0 {
+            return Err("sol_reserve_usd must be ≥ 0".into());
+        }
+        if self.daily_stop_pct <= 0.0 || self.daily_stop_pct > 100.0 {
+            return Err("daily_stop_pct must be 0–100".into());
+        }
+        if self.ticket_ttl_secs == 0 || self.ticket_ttl_secs > 300 {
+            return Err("ticket_ttl_secs must be 1–300".into());
+        }
+        Ok(())
+    }
+
     pub fn load(data_dir: &std::path::Path) -> Result<Self, String> {
         let path = data_dir.join("jupiter_config.json");
         if path.exists() {
             let json = std::fs::read_to_string(&path)
                 .map_err(|e| format!("Failed to read Jupiter config: {e}"))?;
-            serde_json::from_str(&json)
-                .map_err(|e| format!("Failed to parse Jupiter config: {e}"))
+            let config: Self = serde_json::from_str(&json)
+                .map_err(|e| format!("Failed to parse Jupiter config: {e}"))?;
+            config.validate()?;
+            Ok(config)
         } else {
             Ok(Self::default())
         }

@@ -10,7 +10,7 @@
 use ed25519_dalek::{Signer, SigningKey};
 use zeroize::Zeroize;
 
-use super::config::{ALLOWED_PROGRAMS, COMPUTE_BUDGET};
+use super::config::{ALLOWED_PROGRAMS, COMPUTE_BUDGET, SYSTEM_PROGRAM, SPL_TOKEN, TOKEN_2022};
 
 // ── Verification ticket ───────────────────────────────────────────────────────
 
@@ -26,10 +26,16 @@ pub struct SignerTicket {
     pub expected_in_amount: u64,
     /// Last valid block height from Jupiter's response
     pub last_valid_block_height: u64,
-    /// Current confirmed slot (fetched before calling sign — no network in signer)
-    pub current_slot: u64,
+    /// Current confirmed BLOCK HEIGHT (from getBlockHeight — not getSlot).
+    /// Must be < last_valid_block_height for the blockhash to be valid.
+    pub current_block_height: u64,
     /// Priority fee cap in SOL
     pub priority_fee_cap_sol: f64,
+    /// Pre-resolved accounts from address lookup tables, in correct order:
+    ///   per-ALT: writable accounts (in index order) then readonly accounts.
+    /// Must be fetched by the caller (async) before calling verify_and_sign.
+    /// Empty for legacy (non-v0) transactions.
+    pub resolved_alt_accounts: Vec<[u8; 32]>,
 }
 
 // ── Public sign function ──────────────────────────────────────────────────────
@@ -88,10 +94,11 @@ fn sign_internal(
         return Err("Keypair must be at least 32 bytes".into());
     }
 
-    let seed: [u8; 32] = key_bytes[..32]
+    let mut seed: [u8; 32] = key_bytes[..32]
         .try_into()
         .map_err(|_| "Cannot read 32-byte seed")?;
     let signing_key = SigningKey::from_bytes(&seed);
+    seed.zeroize();
 
     // Verify the public key matches the expected fee payer
     let derived_pubkey_bytes = signing_key.verifying_key().to_bytes();
@@ -125,24 +132,38 @@ fn sign_internal(
         ));
     }
 
-    // 5. Verify all program IDs are in the allowlist
-    for prog_idx in &parsed.program_indices {
-        if (*prog_idx as usize) >= parsed.account_keys.len() {
-            return Err(format!("Program index {prog_idx} out of bounds"));
+    // 5b. Build full account list: static keys + pre-resolved ALT accounts.
+    let num_static_keys = parsed.account_keys.len();
+    let mut full_accounts: Vec<[u8; 32]> = parsed.account_keys.clone();
+    full_accounts.extend_from_slice(&ticket.resolved_alt_accounts);
+
+    let all_keys_b58: Vec<String> = full_accounts
+        .iter()
+        .map(|k| bs58::encode(k).into_string())
+        .collect();
+
+    // 5c. If there are ALT references in the transaction but no resolved accounts
+    //     were provided, fail closed rather than skipping the checks.
+    if !parsed.alt_refs.is_empty() && ticket.resolved_alt_accounts.is_empty() {
+        return Err(format!(
+            "Transaction uses {} address lookup table(s) but resolved_alt_accounts is empty — \
+             caller must resolve ALTs before signing",
+            parsed.alt_refs.len()
+        ));
+    }
+
+    // 6. Verify all program IDs are in the allowlist (re-check with full account list)
+    for inst in &parsed.instructions {
+        if (inst.prog_idx as usize) >= all_keys_b58.len() {
+            return Err(format!("Program index {} out of bounds", inst.prog_idx));
         }
-        let prog_b58 = bs58::encode(&parsed.account_keys[*prog_idx as usize]).into_string();
+        let prog_b58 = &all_keys_b58[inst.prog_idx as usize];
         if !ALLOWED_PROGRAMS.contains(&prog_b58.as_str()) {
             return Err(format!("Disallowed program in transaction: {prog_b58}"));
         }
     }
 
-    // 6. Verify expected mints appear in the account keys
-    let all_keys_b58: Vec<String> = parsed
-        .account_keys
-        .iter()
-        .map(|k| bs58::encode(k).into_string())
-        .collect();
-
+    // 7. Verify expected mints appear somewhere in the full account list.
     if !all_keys_b58.contains(&ticket.expected_input_mint) {
         return Err(format!(
             "Expected input mint {} not found in transaction accounts",
@@ -156,7 +177,10 @@ fn sign_internal(
         ));
     }
 
-    // 7. Check priority fee from Compute Budget instruction
+    // 8. Instruction semantic checks.
+    check_instruction_semantics(&parsed, num_static_keys, &all_keys_b58)?;
+
+    // 9. Check priority fee from Compute Budget instruction
     let priority_fee_lamports = extract_priority_fee_lamports(&parsed, &all_keys_b58);
     let priority_fee_sol = priority_fee_lamports as f64 / 1_000_000_000.0;
     if priority_fee_sol > ticket.priority_fee_cap_sol {
@@ -166,13 +190,16 @@ fn sign_internal(
         ));
     }
 
-    // 8. Verify blockhash hasn't expired
-    // Solana blockhashes are valid for ~150 slots. We check the last_valid_block_height
-    // from Jupiter's response against the current confirmed slot.
-    if ticket.current_slot > ticket.last_valid_block_height {
+    // 10. Verify blockhash hasn't expired.
+    // Compare current BLOCK HEIGHT against lastValidBlockHeight (both are block heights).
+    // Fail closed on RPC error (current_block_height == 0 is treated as unknown).
+    if ticket.current_block_height == 0 {
+        return Err("Current block height unavailable — cannot verify blockhash expiry".into());
+    }
+    if ticket.current_block_height > ticket.last_valid_block_height {
         return Err(format!(
-            "Blockhash expired: current slot {} > last valid {}",
-            ticket.current_slot, ticket.last_valid_block_height
+            "Blockhash expired: current block height {} > last valid {}",
+            ticket.current_block_height, ticket.last_valid_block_height
         ));
     }
 
@@ -191,12 +218,27 @@ fn sign_internal(
 
 // ── Minimal Solana transaction parser ────────────────────────────────────────
 
+struct ParsedInstruction {
+    prog_idx: u8,
+    /// Indices into the full account list (static + ALT) for this instruction.
+    account_indices: Vec<u8>,
+    data: Vec<u8>,
+}
+
+/// Reference to an address lookup table used by a v0 transaction.
+struct AltRef {
+    table_address: [u8; 32],
+    writable_indices: Vec<u8>,
+    readonly_indices: Vec<u8>,
+}
+
 struct ParsedTransaction {
     num_sigs: usize,
     account_keys: Vec<[u8; 32]>,
-    program_indices: Vec<u8>,
-    instructions_data: Vec<(u8, Vec<u8>)>, // (program_id_index, data)
+    instructions: Vec<ParsedInstruction>,
     message_bytes: Vec<u8>,
+    /// Address lookup table references (v0 transactions only).
+    alt_refs: Vec<AltRef>,
 }
 
 /// Parse a serialised Solana VersionedTransaction or legacy Transaction.
@@ -277,8 +319,7 @@ fn parse_transaction(bytes: &[u8]) -> Result<ParsedTransaction, String> {
     let (num_ixs, consumed) = decode_compact_u16(&bytes[pos..])?;
     pos += consumed;
 
-    let mut program_indices: Vec<u8> = Vec::new();
-    let mut instructions_data: Vec<(u8, Vec<u8>)> = Vec::new();
+    let mut instructions: Vec<ParsedInstruction> = Vec::new();
 
     for _ in 0..num_ixs {
         if pos >= bytes.len() {
@@ -287,14 +328,13 @@ fn parse_transaction(bytes: &[u8]) -> Result<ParsedTransaction, String> {
         let prog_idx = bytes[pos];
         pos += 1;
 
-        program_indices.push(prog_idx);
-
-        // Account indices
+        // Account indices — stored for semantic checks
         let (num_accts, consumed) = decode_compact_u16(&bytes[pos..])?;
         pos += consumed;
         if pos + num_accts as usize > bytes.len() {
             return Err("Transaction too short for instruction accounts".into());
         }
+        let account_indices = bytes[pos..pos + num_accts as usize].to_vec();
         pos += num_accts as usize;
 
         // Instruction data
@@ -304,19 +344,52 @@ fn parse_transaction(bytes: &[u8]) -> Result<ParsedTransaction, String> {
             return Err("Transaction too short for instruction data".into());
         }
         let data = bytes[pos..pos + data_len as usize].to_vec();
-        instructions_data.push((prog_idx, data));
+        instructions.push(ParsedInstruction { prog_idx, account_indices, data });
         pos += data_len as usize;
     }
 
-    // Message bytes = everything from message_start to end (or through address lookups for v0)
+    // 8. Address lookup tables (v0 only)
+    let mut alt_refs: Vec<AltRef> = Vec::new();
+    if is_versioned && pos < bytes.len() {
+        let (num_alts, consumed) = decode_compact_u16(&bytes[pos..])?;
+        pos += consumed;
+        for _ in 0..num_alts {
+            if pos + 32 > bytes.len() {
+                return Err("Transaction too short for ALT address".into());
+            }
+            let mut table_address = [0u8; 32];
+            table_address.copy_from_slice(&bytes[pos..pos + 32]);
+            pos += 32;
+
+            let (num_writable, consumed) = decode_compact_u16(&bytes[pos..])?;
+            pos += consumed;
+            if pos + num_writable as usize > bytes.len() {
+                return Err("Transaction too short for ALT writable indices".into());
+            }
+            let writable_indices = bytes[pos..pos + num_writable as usize].to_vec();
+            pos += num_writable as usize;
+
+            let (num_readonly, consumed) = decode_compact_u16(&bytes[pos..])?;
+            pos += consumed;
+            if pos + num_readonly as usize > bytes.len() {
+                return Err("Transaction too short for ALT readonly indices".into());
+            }
+            let readonly_indices = bytes[pos..pos + num_readonly as usize].to_vec();
+            pos += num_readonly as usize;
+
+            alt_refs.push(AltRef { table_address, writable_indices, readonly_indices });
+        }
+    }
+
+    // Message bytes = everything from message_start to end
     let message_bytes = bytes[message_start..].to_vec();
 
     Ok(ParsedTransaction {
         num_sigs: num_sigs as usize,
         account_keys,
-        program_indices,
-        instructions_data,
+        instructions,
         message_bytes,
+        alt_refs,
     })
 }
 
@@ -390,24 +463,23 @@ fn extract_priority_fee_lamports(
     let mut cu_price: u64 = 0; // microlamports per CU
     let mut cu_limit: u64 = 200_000; // default CU limit
 
-    for (prog_idx, data) in &parsed.instructions_data {
-        let prog = all_keys_b58.get(*prog_idx as usize).map(|s| s.as_str());
+    for inst in &parsed.instructions {
+        let prog = all_keys_b58.get(inst.prog_idx as usize).map(|s| s.as_str());
         if prog != Some(COMPUTE_BUDGET) {
             continue;
         }
-        if data.is_empty() {
+        if inst.data.is_empty() {
             continue;
         }
-        match data[0] {
-            2 if data.len() >= 5 => {
+        match inst.data[0] {
+            2 if inst.data.len() >= 5 => {
                 // SetComputeUnitLimit: discriminant 2, u32 LE units
-                let units = u32::from_le_bytes(data[1..5].try_into().unwrap_or([0; 4]));
+                let units = u32::from_le_bytes(inst.data[1..5].try_into().unwrap_or([0; 4]));
                 cu_limit = units as u64;
             }
-            3 if data.len() >= 9 => {
+            3 if inst.data.len() >= 9 => {
                 // SetComputeUnitPrice: discriminant 3, u64 LE microlamports
-                let price =
-                    u64::from_le_bytes(data[1..9].try_into().unwrap_or([0; 8]));
+                let price = u64::from_le_bytes(inst.data[1..9].try_into().unwrap_or([0; 8]));
                 cu_price = price;
             }
             _ => {}
@@ -418,15 +490,97 @@ fn extract_priority_fee_lamports(
     cu_limit.saturating_mul(cu_price) / 1_000_000
 }
 
+/// Check instruction semantics against known dangerous patterns.
+///
+/// Blocks:
+/// - SPL Token / Token-2022: Approve (4), ApproveChecked (13), SetAuthority (6).
+///   These grant control over tokens to arbitrary third parties.
+/// - System Program Transfer where the destination is in an address lookup table
+///   (not static keys). Jupiter's normal wSOL wrapping always uses a static
+///   destination; an ALT-sourced destination is a drain indicator.
+fn check_instruction_semantics(
+    parsed: &ParsedTransaction,
+    num_static_keys: usize,
+    all_keys_b58: &[String],
+) -> Result<(), String> {
+    for inst in &parsed.instructions {
+        let prog_b58 = all_keys_b58
+            .get(inst.prog_idx as usize)
+            .map(|s| s.as_str())
+            .unwrap_or("");
+
+        if prog_b58 == SPL_TOKEN || prog_b58 == TOKEN_2022 {
+            if !inst.data.is_empty() {
+                match inst.data[0] {
+                    4 => return Err(
+                        "SPL Token Approve instruction is not permitted — \
+                         it grants spending rights to a third party"
+                            .into(),
+                    ),
+                    6 => return Err(
+                        "SPL Token SetAuthority instruction is not permitted — \
+                         it transfers token account ownership"
+                            .into(),
+                    ),
+                    13 => return Err(
+                        "SPL Token ApproveChecked instruction is not permitted".into(),
+                    ),
+                    _ => {}
+                }
+            }
+        } else if prog_b58 == SYSTEM_PROGRAM {
+            // System Transfer discriminant is u32 LE = 2
+            if inst.data.len() >= 4 {
+                let discriminant =
+                    u32::from_le_bytes(inst.data[..4].try_into().unwrap_or([0; 4]));
+                if discriminant == 2 {
+                    // Transfer — verify destination is in static accounts, not ALT
+                    if let Some(&dest_idx) = inst.account_indices.get(1) {
+                        if (dest_idx as usize) >= num_static_keys {
+                            return Err(format!(
+                                "System Program Transfer: destination account index {} is \
+                                 sourced from an address lookup table — refusing to sign",
+                                dest_idx
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 // ── Keypair loading ───────────────────────────────────────────────────────────
 
 fn load_keypair_bytes(key_path: &str) -> Result<Vec<u8>, String> {
-    let content = std::fs::read_to_string(key_path)
+    let mut content = std::fs::read_to_string(key_path)
         .map_err(|e| format!("Failed to read keypair file: {e}"))?;
 
     // Solana CLI saves keypairs as a JSON array of bytes: [1,2,3,...]
-    serde_json::from_str::<Vec<u8>>(&content)
-        .map_err(|e| format!("Failed to parse keypair JSON: {e}"))
+    let result = serde_json::from_str::<Vec<u8>>(&content)
+        .map_err(|e| format!("Failed to parse keypair JSON: {e}"));
+
+    // Zeroize the string contents to clear key bytes from heap memory.
+    content.zeroize();
+
+    result
+}
+
+/// Parse a transaction's ALT references for pre-signing resolution.
+/// Returns (static_account_keys, alt_refs) where each alt_ref is
+/// (table_address, writable_indices, readonly_indices).
+/// Called by the swap orchestrator to fetch ALT accounts before verify_and_sign.
+pub fn parse_alts_for_resolve(
+    bytes: &[u8],
+) -> Result<(Vec<[u8; 32]>, Vec<([u8; 32], Vec<u8>, Vec<u8>)>), String> {
+    let parsed = parse_transaction(bytes)?;
+    let alt_refs = parsed
+        .alt_refs
+        .into_iter()
+        .map(|a| (a.table_address, a.writable_indices, a.readonly_indices))
+        .collect();
+    Ok((parsed.account_keys, alt_refs))
 }
 
 // ── Test helpers (compiled only under cargo test) ─────────────────────────────
@@ -438,7 +592,8 @@ pub fn parse_transaction_for_test(
     bytes: &[u8],
 ) -> Result<(Vec<[u8; 32]>, Vec<u8>), String> {
     let parsed = parse_transaction(bytes)?;
-    Ok((parsed.account_keys, parsed.program_indices))
+    let program_indices = parsed.instructions.iter().map(|i| i.prog_idx).collect();
+    Ok((parsed.account_keys, program_indices))
 }
 
 // ── Tests ─────────────────────────────────────────────────────────────────────
@@ -607,9 +762,9 @@ pub mod tests {
             .map(|k| bs58::encode(k).into_string())
             .collect();
 
-        let has_bad = parsed.program_indices.iter().any(|&idx| {
+        let has_bad = parsed.instructions.iter().any(|inst| {
             all_keys_b58
-                .get(idx as usize)
+                .get(inst.prog_idx as usize)
                 .map(|k| !ALLOWED_PROGRAMS.contains(&k.as_str()))
                 .unwrap_or(false)
         });
@@ -639,9 +794,9 @@ pub mod tests {
             .map(|k| bs58::encode(k).into_string())
             .collect();
 
-        let all_allowed = parsed.program_indices.iter().all(|&idx| {
+        let all_allowed = parsed.instructions.iter().all(|inst| {
             all_keys_b58
-                .get(idx as usize)
+                .get(inst.prog_idx as usize)
                 .map(|k| ALLOWED_PROGRAMS.contains(&k.as_str()))
                 .unwrap_or(false)
         });
@@ -768,31 +923,33 @@ pub mod tests {
 
     #[test]
     fn expired_blockhash_is_detected_by_ticket() {
-        // current_slot > last_valid_block_height => expired
+        // current_block_height > last_valid_block_height => expired
         let ticket = SignerTicket {
             expected_fee_payer: "fake".into(),
             expected_input_mint: "fake".into(),
             expected_output_mint: "fake".into(),
             expected_in_amount: 0,
             last_valid_block_height: 100,
-            current_slot: 200, // past expiry
+            current_block_height: 200, // past expiry
             priority_fee_cap_sol: 0.001,
+            resolved_alt_accounts: vec![],
         };
         assert!(
-            ticket.current_slot > ticket.last_valid_block_height,
+            ticket.current_block_height > ticket.last_valid_block_height,
             "ticket should indicate expired blockhash"
         );
     }
 
-    fn make_ticket(signing_key: &SigningKey, pubkey_b58: &str) -> SignerTicket {
+    fn make_ticket(_signing_key: &SigningKey, pubkey_b58: &str) -> SignerTicket {
         SignerTicket {
             expected_fee_payer: pubkey_b58.to_string(),
             expected_input_mint: super::super::config::SOL_MINT.into(),
             expected_output_mint: super::super::config::USDC_MINT.into(),
             expected_in_amount: 1_000_000_000,
             last_valid_block_height: 99_999_999,
-            current_slot: 1_000,
+            current_block_height: 1_000,
             priority_fee_cap_sol: 0.001,
+            resolved_alt_accounts: vec![],
         }
     }
 }

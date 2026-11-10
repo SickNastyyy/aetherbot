@@ -229,23 +229,17 @@ pub fn jupiter_get_config() -> Result<JupiterSwapConfig, String> {
 }
 
 #[tauri::command]
-pub fn jupiter_save_config(config: JupiterSwapConfig) -> Result<(), String> {
-    // Validate hard limits before saving
-    if config.account_cap_usd > 250.0 {
-        return Err(format!(
-            "account_cap_usd {:.2} exceeds hard maximum of $250. \
-             Raise this only if you have explicitly reviewed the risk.",
-            config.account_cap_usd
-        ));
-    }
-    if config.max_swap_pct > 100.0 || config.max_swap_pct <= 0.0 {
-        return Err("max_swap_pct must be 0–100".into());
-    }
-    if config.max_slippage_bps > 1000 {
-        return Err("max_slippage_bps must be ≤ 1000 (10%)".into());
-    }
+pub async fn jupiter_save_config(
+    config: JupiterSwapConfig,
+    jup_state: tauri::State<'_, JupiterState>,
+) -> Result<(), String> {
+    // Validate all limits (config.validate() checks all 8 hard limits)
+    config.validate()?;
     let data_dir = paths::get_data_dir()?;
-    config.save(&data_dir)
+    config.save(&data_dir)?;
+    // Reset the orchestrator so the new config is picked up on the next call
+    *jup_state.lock().await = None;
+    Ok(())
 }
 
 /// Step 1 + 2: Fetch a quote and run all safety gates.
@@ -269,7 +263,19 @@ pub async fn jupiter_quote_swap(
         let conn = rusqlite::Connection::open(&db_path)
             .map_err(|e| format!("DB open: {e}"))?;
         let arc_db = Arc::new(Database { conn: std::sync::Mutex::new(conn) });
-        *lock = Some(SwapOrchestrator::new(config, arc_db));
+        let orchestrator = SwapOrchestrator::new(config, arc_db);
+
+        // Restore persisted kill switch state
+        let ks_active = {
+            let db_conn = db.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+            crate::database::get_kill_switch(&db_conn)
+                .map_err(|e| format!("DB get_kill_switch: {e}"))?
+        };
+        if ks_active {
+            orchestrator.kill_switch().activate();
+        }
+
+        *lock = Some(orchestrator);
     }
 
     let orchestrator = lock.as_ref().unwrap();
@@ -299,7 +305,18 @@ pub async fn jupiter_approve_ticket(
 pub async fn jupiter_execute_approved(
     ticket_id: String,
     jup_state: tauri::State<'_, JupiterState>,
+    db: tauri::State<'_, Database>,
 ) -> Result<SwapTicket, String> {
+    // Check DB kill switch before acquiring the orchestrator lock
+    {
+        let conn = db.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+        let ks = crate::database::get_kill_switch(&conn)
+            .map_err(|e| format!("DB get_kill_switch: {e}"))?;
+        if ks {
+            return Err("Kill switch is active — execution blocked".into());
+        }
+    }
+
     let lock = jup_state.lock().await;
     let orchestrator = lock
         .as_ref()
@@ -308,11 +325,21 @@ pub async fn jupiter_execute_approved(
 }
 
 /// One command that blocks all new swap tickets immediately.
+/// Persists to DB so the kill switch survives restarts.
 #[tauri::command]
 pub async fn jupiter_kill_switch(
     activate: bool,
     jup_state: tauri::State<'_, JupiterState>,
+    db: tauri::State<'_, Database>,
 ) -> Result<(), String> {
+    // Persist to DB first — works even if orchestrator is not running
+    {
+        let conn = db.conn.lock().map_err(|e| format!("DB lock: {e}"))?;
+        crate::database::set_kill_switch(&conn, activate)
+            .map_err(|e| format!("DB set_kill_switch: {e}"))?;
+    }
+
+    // Also set on the in-memory orchestrator if it exists
     let lock = jup_state.lock().await;
     if let Some(orchestrator) = lock.as_ref() {
         if activate {
@@ -320,11 +347,8 @@ pub async fn jupiter_kill_switch(
         } else {
             orchestrator.kill_switch().deactivate();
         }
-        Ok(())
-    } else {
-        // Even if orchestrator isn't running, return Ok — the switch concept is acknowledged
-        Ok(())
     }
+    Ok(())
 }
 
 /// Return the Jupiter audit log (most recent first).

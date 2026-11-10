@@ -42,22 +42,26 @@ pub struct SwapTicket {
     pub gate_results: Vec<GateResult>,
     pub all_gates_passed: bool,
     pub status: TicketStatus,
-    /// Base64-encoded unsigned transaction (set after owner approval step)
+    /// Base64-encoded unsigned transaction from /order response (bound to this quote).
     pub unsigned_tx_b64: Option<String>,
+    /// Unix timestamp at ticket creation — used for TTL enforcement.
+    pub created_at_ts: i64,
+    /// SOL price at quote time — used for gate re-run at execute time.
+    pub sol_price_usd_at_quote: f64,
 }
 
 impl SwapTicket {
-    pub fn from_quote(quote: &SwapQuote, gate_results: Vec<GateResult>) -> Self {
+    pub fn from_quote(quote: &SwapQuote, gate_results: Vec<GateResult>, sol_price_usd: f64) -> Self {
         let all_gates_passed = super::gates::all_gates_passed(&gate_results);
+        let now = chrono::Utc::now();
         let id = format!(
             "jup-{}",
-            chrono::Utc::now()
-                .timestamp_nanos_opt()
-                .unwrap_or_else(|| chrono::Utc::now().timestamp_millis() * 1_000_000)
+            now.timestamp_nanos_opt()
+                .unwrap_or_else(|| now.timestamp_millis() * 1_000_000)
         );
         Self {
             id,
-            created_at: chrono::Utc::now().to_rfc3339(),
+            created_at: now.to_rfc3339(),
             input_mint: quote.input_mint.clone(),
             output_mint: quote.output_mint.clone(),
             in_amount: quote.in_amount,
@@ -71,8 +75,16 @@ impl SwapTicket {
             gate_results,
             all_gates_passed,
             status: TicketStatus::PendingApproval,
-            unsigned_tx_b64: None,
+            unsigned_tx_b64: quote.unsigned_tx_b64.clone(),
+            created_at_ts: now.timestamp(),
+            sol_price_usd_at_quote: sol_price_usd,
         }
+    }
+
+    /// Returns true if the ticket is older than `ttl_secs` seconds.
+    pub fn is_expired(&self, ttl_secs: u64) -> bool {
+        let age = chrono::Utc::now().timestamp() - self.created_at_ts;
+        age > ttl_secs as i64
     }
 }
 

@@ -33,6 +33,7 @@ fn default_config() -> JupiterSwapConfig {
         priority_fee_cap_sol: 0.0005,
         signer_key_path: Some("/fake/key.json".into()),
         live_execution_enabled: true,
+        ticket_ttl_secs: 30,
     }
 }
 
@@ -49,6 +50,8 @@ fn fresh_sol_to_usdc_quote(in_lamports: u64) -> SwapQuote {
         last_valid_block_height: 99_999_999,
         fetched_at: chrono::Utc::now().timestamp(),
         route_label: "Orca".into(),
+        unsigned_tx_b64: None,
+        request_id: None,
     }
 }
 
@@ -693,6 +696,8 @@ fn ticket_status_pending_means_no_resubmit() {
             signature: "5abc123".into(),
         },
         unsigned_tx_b64: None,
+        created_at_ts: chrono::Utc::now().timestamp(),
+        sol_price_usd_at_quote: 150.0,
     };
 
     // A PENDING ticket must NOT be re-submitted — only reconciled
